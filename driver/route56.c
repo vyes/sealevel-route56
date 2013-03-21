@@ -655,9 +655,9 @@ static int r56_ioctl_common(struct r56_struct *info, unsigned int cmd, unsigned 
 #if R56_GENERIC_HDLC
 #define dev_to_port(D) (dev_to_hdlc(D)->priv)
 static void hdlcdev_tx_done(struct r56_struct *info);
-static void hdlcdev_rx(struct r56_struct *info, char *buf, int size);
-static int  hdlcdev_init(struct r56_struct *info);
-static void hdlcdev_exit(struct r56_struct *info);
+static void hdlcdev_rx(struct mgsl_struct *info, char *buf, int size);
+static int  hdlcdev_init(struct mgsl_struct *info);
+static void hdlcdev_exit(struct mgsl_struct *info);
 #endif
 
 /*
@@ -1681,7 +1681,7 @@ static irqreturn_t r56_interrupt(int irq, void *dev_id)
 	spin_unlock(&info->irq_spinlock);
 	
 	if ( debug_level >= DEBUG_LEVEL_ISR )	
-		printk(KERN_DEBUG "%s(%d):r56_interrupt(%d)exit.\n",
+		printk(KERN_DEBUG "%s(%d):mgsl_interrupt(%d)exit.\n",
 			__FILE__, __LINE__, info->irq_level);
 
 	return IRQ_HANDLED;
@@ -4065,7 +4065,7 @@ static int r56_claim_resources(struct r56_struct *info)
 	info->irq_requested = true;
 	
 	if ( info->bus_type == R56_BUS_TYPE_PCI ) {
-			if(!(info->lcr_base = ioremap(info->phys_lcr_base,256)))
+			if(!(info->lcr_base = ioremap_nocache(info->phys_lcr_base,256)))
 			{
 				printk ("%s(%d):Can't map shared memory on device %s MemAddr=%08X\n",
 				 			__FILE__, __LINE__, info->device_name,
@@ -4075,7 +4075,7 @@ static int r56_claim_resources(struct r56_struct *info)
 
 		info->lcr_mem_requested = 1;
 
-		info->memory_base = ioremap(info->phys_memory_base,SHARED_MEM_ADDRESS_SIZE);
+		info->memory_base = ioremap_nocache(info->phys_memory_base,SHARED_MEM_ADDRESS_SIZE);
 		if (!info->memory_base) {
 			printk( "%s(%d):Can't map shared memory on device %s MemAddr=%08X\n",
 				__FILE__,__LINE__,info->device_name, info->phys_memory_base );
@@ -4088,7 +4088,7 @@ static int r56_claim_resources(struct r56_struct *info)
 			goto errout;
 		}
 		
-		info->lcr_base = ioremap(info->phys_lcr_base,PAGE_SIZE) + info->lcr_offset;
+		info->lcr_base = ioremap_nocache(info->phys_lcr_base,PAGE_SIZE) + info->lcr_offset;
 		if (!info->lcr_base) {
 			printk( "%s(%d):Can't map LCR memory on device %s MemAddr=%08X\n",
 				__FILE__,__LINE__,info->device_name, info->phys_lcr_base );

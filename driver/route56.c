@@ -654,10 +654,10 @@ static int r56_ioctl_common(struct r56_struct *info, unsigned int cmd, unsigned 
 
 #if R56_GENERIC_HDLC
 #define dev_to_port(D) (dev_to_hdlc(D)->priv)
-static void hdlcdev_tx_done(struct mgsl_struct *info);
-static void hdlcdev_rx(struct mgsl_struct *info, char *buf, int size);
-static int  hdlcdev_init(struct mgsl_struct *info);
-static void hdlcdev_exit(struct mgsl_struct *info);
+static void hdlcdev_tx_done(struct r56_struct *info);
+static void hdlcdev_rx(struct r56_struct *info, char *buf, int size);
+static int  hdlcdev_init(struct r56_struct *info);
+static void hdlcdev_exit(struct r56_struct *info);
 #endif
 
 /*
@@ -1641,21 +1641,15 @@ static irqreturn_t r56_interrupt(int irq, void *dev_id)
 	spin_lock(&info->irq_spinlock);
 
 //	for(;;) {
+		/* Read the interrupt vectors from hardware. */
 		UscVector = usc_InReg(info, IVR) >> 9;
 		DmaVector = usc_InDmaReg(info, DIVR);
-
+		
 		if ( debug_level >= DEBUG_LEVEL_ISR )	
-			printk("%s(%d):%s UscVector=%04X DmaVector=%04X\n",
-				__FILE__, __LINE__, info->device_name, 
-				UscVector, DmaVector);
-
-		if (!UscVector && !(DmaVector &(BIT10|BIT9)))
-		{
-			spin_unlock(&info->irq_spinlock);
-			return IRQ_NONE;
-		}
+			printk("%s(%d):%s UscVector=%08X DmaVector=%08X\n",
+				__FILE__,__LINE__,info->device_name,UscVector,DmaVector);
 			
-		// Dispatch interrupt vector
+		/* Dispatch interrupt vector */
 		if ( UscVector )
 			(*UscIsrTable[UscVector])(info);
 		else if ( (DmaVector&(BIT10|BIT9)) == BIT10)
@@ -1664,8 +1658,8 @@ static irqreturn_t r56_interrupt(int irq, void *dev_id)
 			r56_isr_receive_dma(info);
 
 		if ( info->isr_overflow ) {
-			printk(KERN_ERR"%s(%d):%s isr overflow irq=%d\n",
-				__FILE__,__LINE__,info->device_name, irq);
+			printk(KERN_ERR "%s(%d):%s isr overflow irq=%d\n",
+				__FILE__, __LINE__, info->device_name, info->irq_level);
 			usc_DisableMasterIrqBit(info);
 			usc_DisableDmaInterrupts(info,DICR_MASTER);
 //			break;
@@ -1687,9 +1681,9 @@ static irqreturn_t r56_interrupt(int irq, void *dev_id)
 	spin_unlock(&info->irq_spinlock);
 	
 	if ( debug_level >= DEBUG_LEVEL_ISR )	
-		printk("%s(%d):r56_interrupt(%d)exit.\n",
-			__FILE__,__LINE__,irq);
-	
+		printk(KERN_DEBUG "%s(%d):r56_interrupt(%d)exit.\n",
+			__FILE__, __LINE__, info->irq_level);
+
 	return IRQ_HANDLED;
 }	/* end of r56_interrupt() */
 
@@ -1994,7 +1988,7 @@ static int r56_put_char(struct tty_struct *tty, unsigned char ch)
 	spin_unlock_irqrestore(&info->irq_spinlock, flags);
 	return ret;
 	
-}	/* end of mgsl_put_char() */
+}	/* end of r56_put_char() */
 
 /* r56_flush_chars()
  * 
@@ -7738,7 +7732,7 @@ static int usc_loopmode_active( struct r56_struct * info)
 static int hdlcdev_attach(struct net_device *dev, unsigned short encoding,
 			  unsigned short parity)
 {
-	struct mgsl_struct *info = dev_to_port(dev);
+	struct r56_struct *info = dev_to_port(dev);
 	unsigned char  new_encoding;
 	unsigned short new_crctype;
 
@@ -7769,7 +7763,7 @@ static int hdlcdev_attach(struct net_device *dev, unsigned short encoding,
 
 	/* if network interface up, reprogram hardware */
 	if (info->netcount)
-		mgsl_program_hw(info);
+		r56_program_hw(info);
 
 	return 0;
 }
@@ -7783,7 +7777,7 @@ static int hdlcdev_attach(struct net_device *dev, unsigned short encoding,
 static netdev_tx_t hdlcdev_xmit(struct sk_buff *skb,
 				      struct net_device *dev)
 {
-	struct mgsl_struct *info = dev_to_port(dev);
+	struct r56_struct *info = dev_to_port(dev);
 	unsigned long flags;
 
 	if (debug_level >= DEBUG_LEVEL_INFO)
@@ -7794,7 +7788,7 @@ static netdev_tx_t hdlcdev_xmit(struct sk_buff *skb,
 
 	/* copy data to device buffers */
 	info->xmit_cnt = skb->len;
-	mgsl_load_tx_dma_buffer(info, skb->data, skb->len);
+	r56_load_tx_dma_buffer(info, skb->data, skb->len);
 
 	/* update network statistics */
 	dev->stats.tx_packets++;
@@ -7825,7 +7819,7 @@ static netdev_tx_t hdlcdev_xmit(struct sk_buff *skb,
  */
 static int hdlcdev_open(struct net_device *dev)
 {
-	struct mgsl_struct *info = dev_to_port(dev);
+	struct r56_struct *info = dev_to_port(dev);
 	int rc;
 	unsigned long flags;
 
@@ -7856,7 +7850,7 @@ static int hdlcdev_open(struct net_device *dev)
 
 	/* assert DTR and RTS, apply hardware settings */
 	info->serial_signals |= SerialSignal_RTS + SerialSignal_DTR;
-	mgsl_program_hw(info);
+	r56_program_hw(info);
 
 	/* enable network layer transmit */
 	dev->trans_start = jiffies;
@@ -7883,7 +7877,7 @@ static int hdlcdev_open(struct net_device *dev)
  */
 static int hdlcdev_close(struct net_device *dev)
 {
-	struct mgsl_struct *info = dev_to_port(dev);
+	struct r56_struct *info = dev_to_port(dev);
 	unsigned long flags;
 
 	if (debug_level >= DEBUG_LEVEL_INFO)
@@ -7917,7 +7911,7 @@ static int hdlcdev_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 	const size_t size = sizeof(sync_serial_settings);
 	sync_serial_settings new_line;
 	sync_serial_settings __user *line = ifr->ifr_settings.ifs_ifsu.sync;
-	struct mgsl_struct *info = dev_to_port(dev);
+	struct r56_struct *info = dev_to_port(dev);
 	unsigned int flags;
 
 	if (debug_level >= DEBUG_LEVEL_INFO)
@@ -7998,7 +7992,7 @@ static int hdlcdev_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 
 		/* if network interface up, reprogram hardware */
 		if (info->netcount)
-			mgsl_program_hw(info);
+			r56_program_hw(info);
 		return 0;
 
 	default:
@@ -8013,7 +8007,7 @@ static int hdlcdev_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
  */
 static void hdlcdev_tx_timeout(struct net_device *dev)
 {
-	struct mgsl_struct *info = dev_to_port(dev);
+	struct r56_struct *info = dev_to_port(dev);
 	unsigned long flags;
 
 	if (debug_level >= DEBUG_LEVEL_INFO)
@@ -8035,7 +8029,7 @@ static void hdlcdev_tx_timeout(struct net_device *dev)
  *
  * info  pointer to device instance information
  */
-static void hdlcdev_tx_done(struct mgsl_struct *info)
+static void hdlcdev_tx_done(struct r56_struct *info)
 {
 	if (netif_queue_stopped(info->netdev))
 		netif_wake_queue(info->netdev);
@@ -8049,7 +8043,7 @@ static void hdlcdev_tx_done(struct mgsl_struct *info)
  * buf   pointer to buffer contianing frame data
  * size  count of data bytes in buf
  */
-static void hdlcdev_rx(struct mgsl_struct *info, char *buf, int size)
+static void hdlcdev_rx(struct r56_struct *info, char *buf, int size)
 {
 	struct sk_buff *skb = dev_alloc_skb(size);
 	struct net_device *dev = info->netdev;
@@ -8091,7 +8085,7 @@ static const struct net_device_ops hdlcdev_ops = {
  *
  * returns 0 if success, otherwise error code
  */
-static int hdlcdev_init(struct mgsl_struct *info)
+static int hdlcdev_init(struct r56_struct *info)
 {
 	int rc;
 	struct net_device *dev;
@@ -8136,7 +8130,7 @@ static int hdlcdev_init(struct mgsl_struct *info)
  *
  * info  pointer to device instance information
  */
-static void hdlcdev_exit(struct mgsl_struct *info)
+static void hdlcdev_exit(struct r56_struct *info)
 {
 	unregister_hdlc_device(info->netdev);
 	free_netdev(info->netdev);

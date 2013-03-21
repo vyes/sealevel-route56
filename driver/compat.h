@@ -16,6 +16,12 @@
    #define __devexit_p(x) x
  #endif
  
+ #ifndef __devinit
+   #define __devinit
+ #endif
+ #ifndef __devexit
+   #define __devexit
+ #endif
  // ---------------------------------------------------------------------------
  // The License macro isn't defined in some earlier 2.4 kernels
  // ---------------------------------------------------------------------------

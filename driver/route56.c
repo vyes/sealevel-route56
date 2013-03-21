@@ -86,7 +86,9 @@
 #include <linux/init.h>
 #include <asm/serial.h>
 #include <linux/ioctl.h>
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 4, 0)
 #include <asm/system.h>
+#endif
 #include <asm/io.h>
 #include <asm/irq.h>
 #include <asm/dma.h>
@@ -104,9 +106,15 @@
 #include "route56.h"
 #include "z16c32.h"
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
 static int tiocmget(struct tty_struct *tty, struct file *file);
 static int tiocmset(struct tty_struct *tty, struct file *file,
 		    unsigned int set, unsigned int clear);
+#else
+static int tiocmget(struct tty_struct *tty);
+static int tiocmset(struct tty_struct *tty,
+		    unsigned int set, unsigned int clear);
+#endif
 
 #include "compat.h"
 
@@ -779,7 +787,7 @@ static int r56_device_count;
  * .text section address and breakpoint on module load.
  * This is useful for use with gdb and add-symbol-file command.
  */
-static int break_on_load;
+static bool break_on_load;
 
 /*
  * Driver major number, defaults to zero to get auto
@@ -864,7 +872,11 @@ static void* r56_get_text_ptr(void)
  * memory if large numbers of serial ports are open.
  */
 static unsigned char *tmp_buf;
+#ifdef DEFINE_SEMAPHORE
+static DEFINE_SEMAPHORE(tmp_buf_sem);
+#else
 static DECLARE_MUTEX(tmp_buf_sem);
+#endif
 
 static inline int r56_paranoia_check(struct r56_struct *info,
 					char *name, const char *routine)
@@ -1786,7 +1798,7 @@ static void shutdown(struct r56_struct * info)
 	/* on the ISA adapter. This has no effect for the PCI adapter */
 	usc_OutReg(info, PCR, (u16)((usc_InReg(info, PCR) | BIT13) | BIT12));
 	
- 	if (!info->tty || info->tty->termios->c_cflag & HUPCL) {
+ 	if (!info->tty || C_HUPCL(info->tty)) {
  		info->serial_signals &= ~(SerialSignal_DTR + SerialSignal_RTS);
 		usc_set_serial_signals(info);
 	}
@@ -1829,7 +1841,7 @@ static void r56_program_hw(struct r56_struct *info)
 	usc_EnableInterrupts(info, IO_PIN);
 	usc_get_serial_signals(info);
 		
-	if (info->netcount || info->tty->termios->c_cflag & CREAD)
+	if (info->netcount || C_CREAD(info->tty))
 		usc_start_receiver(info);
 		
 	spin_unlock_irqrestore(&info->irq_spinlock,flags);
@@ -1841,15 +1853,22 @@ static void r56_change_params(struct r56_struct *info)
 {
 	unsigned cflag;
 	int bits_per_char;
-
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
 	if (!info->tty || !info->tty->termios)
+#else
+	if (!info->tty)
+#endif
 		return;
 		
 	if (debug_level >= DEBUG_LEVEL_INFO)
 		printk("%s(%d):r56_change_params(%s)\n",
 			 __FILE__,__LINE__, info->device_name );
-			 
+
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
 	cflag = info->tty->termios->c_cflag;
+#else
+	cflag = info->tty->termios.c_cflag;
+#endif
 
 	/* if B0 rate (hangup) specified then negate DTR and RTS */
 	/* otherwise assert DTR and RTS, but we want to ignore the
@@ -2321,7 +2340,7 @@ static void r56_throttle(struct tty_struct * tty)
 	if (I_IXOFF(tty))
 		r56_send_xchar(tty, STOP_CHAR(tty));
  
- 	if (tty->termios->c_cflag & CRTSCTS) {
+ 	if (C_CRTSCTS(tty)) {
 		spin_lock_irqsave(&info->irq_spinlock,flags);
 		info->serial_signals &= ~SerialSignal_RTS;
 	 	usc_set_serial_signals(info);
@@ -2355,7 +2374,7 @@ static void r56_unthrottle(struct tty_struct * tty)
 			r56_send_xchar(tty, START_CHAR(tty));
 	}
 	
- 	if (tty->termios->c_cflag & CRTSCTS) {
+ 	if (C_CRTSCTS(tty)) {
 		spin_lock_irqsave(&info->irq_spinlock,flags);
 		info->serial_signals |= SerialSignal_RTS;
 	 	usc_set_serial_signals(info);
@@ -2824,7 +2843,11 @@ static int modem_input_wait(struct r56_struct *info,int arg)
 
 /* return the state of the serial control and status signals
  */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
 static int tiocmget(struct tty_struct *tty, struct file *file)
+#else
+static int tiocmget(struct tty_struct *tty)
+#endif
 {
 	struct r56_struct *info = (struct r56_struct *)tty->driver_data;
 	unsigned int result;
@@ -2849,8 +2872,13 @@ static int tiocmget(struct tty_struct *tty, struct file *file)
 
 /* set modem control signals (DTR/RTS)
  */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
 static int tiocmset(struct tty_struct *tty, struct file *file,
 		    unsigned int set, unsigned int clear)
+#else
+static int tiocmset(struct tty_struct *tty,
+		    unsigned int set, unsigned int clear)
+#endif
 {
 	struct r56_struct *info = (struct r56_struct *)tty->driver_data;
  	unsigned long flags;
@@ -2932,7 +2960,10 @@ static int r56_break(struct tty_struct *tty, int break_state)
  * 	
  * Return Value:	0 if success, otherwise error code
  */
-static int r56_ioctl(struct tty_struct *tty, struct file * file,
+static int r56_ioctl(struct tty_struct *tty, 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
+	struct file * file,
+#endif
 		    unsigned int cmd, unsigned long arg)
 {
 	struct r56_struct * info = (struct r56_struct *)tty->driver_data;
@@ -3060,16 +3091,22 @@ static void r56_set_termios(struct tty_struct *tty, struct ktermios *old_termios
 			(cpat_pdriver(tty))->name );
 	
 	/* just return if nothing has changed */
-	if ((tty->termios->c_cflag == old_termios->c_cflag)
-	    && (RELEVANT_IFLAG(tty->termios->c_iflag) 
-		== RELEVANT_IFLAG(old_termios->c_iflag)))
+	if (
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
+		(tty->termios->c_cflag == old_termios->c_cflag)
+		&& (RELEVANT_IFLAG(tty->termios->c_iflag) == RELEVANT_IFLAG(old_termios->c_iflag))
+#else
+		(tty->termios.c_cflag == old_termios->c_cflag)
+		&& (RELEVANT_IFLAG(tty->termios.c_iflag) == RELEVANT_IFLAG(old_termios->c_iflag))
+#endif
+	)
 	  return;
 
 	r56_change_params(info);
 
 	/* Handle transition to B0 status */
 	if (old_termios->c_cflag & CBAUD &&
-	    !(tty->termios->c_cflag & CBAUD)) {
+	    !(C_BAUD(tty))) {
 		info->serial_signals &= ~(SerialSignal_RTS + SerialSignal_DTR);
 		spin_lock_irqsave(&info->irq_spinlock,flags);
 	 	usc_set_serial_signals(info);
@@ -3078,9 +3115,9 @@ static void r56_set_termios(struct tty_struct *tty, struct ktermios *old_termios
 	
 	/* Handle transition away from B0 status */
 	if (!(old_termios->c_cflag & CBAUD) &&
-	    tty->termios->c_cflag & CBAUD) {
+	    C_BAUD(tty)) {
 		info->serial_signals |= SerialSignal_DTR;
- 		if (!(tty->termios->c_cflag & CRTSCTS) || 
+ 		if (!(C_CRTSCTS(tty)) || 
  		    !test_bit(TTY_THROTTLED, &tty->flags)) {
 			info->serial_signals |= SerialSignal_RTS;
  		}
@@ -3091,7 +3128,7 @@ static void r56_set_termios(struct tty_struct *tty, struct ktermios *old_termios
 	
 	/* Handle turning off CRTSCTS */
 	if (old_termios->c_cflag & CRTSCTS &&
-	    !(tty->termios->c_cflag & CRTSCTS)) {
+	    !(C_CRTSCTS(tty))) {
 		tty->hw_stopped = 0;
 		r56_start(tty);
 	}
@@ -3327,7 +3364,7 @@ static int block_til_ready(struct tty_struct *tty, struct file * filp,
 		return 0;
 	}
 
-	if (tty->termios->c_cflag & CLOCAL)
+	if (C_CLOCAL(tty))
 		do_clocal = 1;
 
 	/* Wait for carrier detect and the line to become
@@ -3355,7 +3392,7 @@ static int block_til_ready(struct tty_struct *tty, struct file * filp,
 	
 	while (1) {
 		if ( (info->params.mode == R56_MODE_ASYNC) && 
-					(tty->termios->c_cflag & CBAUD) )
+					C_BAUD(tty) )
 		{
 			spin_lock_irqsave(&info->irq_spinlock,flags);
 			info->serial_signals |= SerialSignal_RTS + SerialSignal_DTR;

@@ -284,7 +284,6 @@ int main(int argc, char* argv[])
 	R56_PARAMS params;
 	R56_PARAMS orig_params;
 	int idlemode;
-	int orig_idlemode;
 	int rc;
 	
 	if ( argc == 1 || !strcmp(argv[1],"--help") ) {
@@ -302,8 +301,7 @@ int main(int argc, char* argv[])
 	argv += 2;
 	
 	memcpy(&orig_params,&params,sizeof(orig_params));
-	orig_idlemode = idlemode;
-
+	
 	rc = parse_cmdline(argc,argv,devname,&params,&idlemode);
 	
 	if (!quiet) {

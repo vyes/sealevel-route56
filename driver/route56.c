@@ -36,6 +36,13 @@
  * This driver has been tested with a slightly modified ppp.c driver
  * for synchronous PPP.
  *
+ * 2000/02/16
+ * Added interface for syncppp.c driver (an alternate synchronous PPP
+ * implementation that also supports Cisco HDLC). Each device instance
+ * registers as a tty device AND a network device (if dosyncppp option
+ * is set for the device). The functionality is determined by which
+ * device interface is opened.
+ *
  * THIS SOFTWARE IS PROVIDED ``AS IS'' AND ANY EXPRESS OR IMPLIED
  * WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES
  * OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
@@ -55,11 +62,9 @@
 #  define BREAKPOINT() { }
 #endif
 
-// MAX_PCI_DEVICES is actually (20 - MAX_ISA_DEVICES)
 #define MAX_ISA_DEVICES 10
 #define MAX_TOTAL_DEVICES 20
 
-#include <linux/version.h>
 #include <linux/module.h>
 #include <linux/errno.h>
 #include <linux/signal.h>
@@ -76,9 +81,7 @@
 #include <linux/ptrace.h>
 #include <linux/ioport.h>
 #include <linux/mm.h>
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 30)
 #include <linux/seq_file.h>
-#endif
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/netdevice.h>
@@ -86,15 +89,21 @@
 #include <linux/init.h>
 #include <asm/serial.h>
 #include <linux/ioctl.h>
-#if LINUX_VERSION_CODE < KERNEL_VERSION(3, 4, 0)
-#include <asm/system.h>
-#endif
 #include <asm/io.h>
 #include <asm/irq.h>
 #include <asm/dma.h>
 #include <linux/bitops.h>
 #include <asm/types.h>
 #include <linux/termios.h>
+#include <linux/workqueue.h>
+#include <linux/hdlc.h>
+#include <linux/dma-mapping.h>
+
+#if defined(CONFIG_HDLC) || (defined(CONFIG_HDLC_MODULE) && defined(CONFIG_R56_MODULE))
+#define R56_GENERIC_HDLC 1
+#else
+#define R56_GENERIC_HDLC 0
+#endif
 
 #define GET_USER(error,value,addr) error = get_user(value,addr)
 #define COPY_FROM_USER(error,dest,src,size) error = copy_from_user(dest,src,size) ? -EFAULT : 0
@@ -105,18 +114,6 @@
 
 #include "route56.h"
 #include "z16c32.h"
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
-static int tiocmget(struct tty_struct *tty, struct file *file);
-static int tiocmset(struct tty_struct *tty, struct file *file,
-		    unsigned int set, unsigned int clear);
-#else
-static int tiocmget(struct tty_struct *tty);
-static int tiocmset(struct tty_struct *tty,
-		    unsigned int set, unsigned int clear);
-#endif
-
-#include "compat.h"
 
 #define RCLRVALUE 0xffff
 
@@ -190,28 +187,20 @@ struct tx_holding_buffer {
  
 struct r56_struct {
 	int			magic;
-	int			flags;
-	int			count;		/* count of opens */
+	struct tty_port		port;
 	int			line;
 	int                     hw_version;
-	unsigned short		close_delay;
-	unsigned short		closing_wait;	/* time to wait before closing */
 	
 	struct r56_icount	icount;
 	
-	struct tty_struct 	*tty;
 	int			timeout;
 	int			x_char;		/* xon/xoff character */
-	int			blocked_open;	/* # of blocked opens */
 	u16			read_status_mask;
 	u16			ignore_status_mask;	
 	unsigned char 		*xmit_buf;
 	int			xmit_head;
 	int			xmit_tail;
 	int			xmit_cnt;
-	
-	wait_queue_head_t	open_wait;
-	wait_queue_head_t	close_wait;
 	
 	wait_queue_head_t	status_event_wait_q;
 	wait_queue_head_t	event_wait_q;
@@ -228,9 +217,9 @@ struct r56_struct {
 
 	u32 pending_bh;
 
-	int bh_running;		/* Protection from multiple */
+	bool bh_running;		/* Protection from multiple */
 	int isr_overflow;
-	int bh_requested;
+	bool bh_requested;
 	
 	int dcd_chkcount;		/* check counts to prevent */
 	int cts_chkcount;		/* too many IRQs if a signal */
@@ -260,12 +249,12 @@ struct r56_struct {
 	int tx_holding_count;		/* number of tx holding buffers waiting */
 	struct tx_holding_buffer tx_holding_buffers[MAX_TX_HOLDING_BUFFERS];
 
-	int rx_enabled;
-	int rx_overflow;
-	int rx_rcc_underrun;
+	bool rx_enabled;
+	bool rx_overflow;
+	bool rx_rcc_underrun;
 
-	int tx_enabled;
-	int tx_active;
+	bool tx_enabled;
+	bool tx_active;
 	u32 idle_mode;
 
 	u16 cmr_value;
@@ -279,14 +268,14 @@ struct r56_struct {
 
 	unsigned int io_base;		/* base I/O address of adapter */
 	unsigned int io_addr_size;	/* size of the I/O address range */
-	int io_addr_requested;		/* nonzero if I/O address requested */
+	bool io_addr_requested;		/* true if I/O address requested */
 	
 	unsigned int irq_level;		/* interrupt level */
 	unsigned long irq_flags;
-	int irq_requested;		/* nonzero if IRQ requested */
+	bool irq_requested;		/* true if IRQ requested */
 	
 	unsigned int dma_level;		/* DMA channel */
-	int dma_requested;		/* nonzero if dma channel requested */
+	bool dma_requested;		/* true if dma channel requested */
 
 	u16 mbre_bit;
 	u16 loopback_bits;
@@ -296,38 +285,40 @@ struct r56_struct {
 
 	unsigned char serial_signals;	/* current serial signal states */
 
-	int irq_occurred;		/* for diagnostics use */
+	bool irq_occurred;		/* for diagnostics use */
 	unsigned int init_error;	/* Initialization startup error 		(DIAGS)	*/
 	int	fDiagnosticsmode;	/* Driver in Diagnostic mode?			(DIAGS)	*/
 
 	u32 last_mem_alloc;
 	unsigned char* memory_base;	/* shared memory address (PCI only) */
 	u32 phys_memory_base;
-	int shared_mem_requested;
+	bool shared_mem_requested;
 
 	unsigned char* lcr_base;	/* local config registers (PCI only) */
 	u32 phys_lcr_base;
 	u32 lcr_offset;
-	int lcr_mem_requested;
+	bool lcr_mem_requested;
 
 	u32 misc_ctrl_value;
 	char flag_buf[MAX_ASYNC_BUFFER_SIZE];
 	char char_buf[MAX_ASYNC_BUFFER_SIZE];	
-	BOOLEAN drop_rts_on_tx_done;
-	BOOLEAN enable_rx_on_tx_done;
+	bool drop_rts_on_tx_done;
+	bool enable_rx_on_tx_done;
 
-	BOOLEAN loopmode_insert_requested;
-	BOOLEAN	loopmode_send_done_requested;
+	bool loopmode_insert_requested;
+	bool loopmode_send_done_requested;
 	
 	struct	_input_signal_events	input_signal_events;
-
-	int all_resources_claimed;
 
 	/* generic HDLC device parts */
 	int netcount;
 	spinlock_t netlock;
 
+#if R56_GENERIC_HDLC
+	struct net_device *netdev;
+#endif
 };
+
 #define R56_MAGIC 0x5401
 
 /*
@@ -661,6 +652,14 @@ static void usc_loopmode_send_done( struct r56_struct * info );
 
 static int r56_ioctl_common(struct r56_struct *info, unsigned int cmd, unsigned long arg);
 
+#if R56_GENERIC_HDLC
+#define dev_to_port(D) (dev_to_hdlc(D)->priv)
+static void hdlcdev_tx_done(struct mgsl_struct *info);
+static void hdlcdev_rx(struct mgsl_struct *info, char *buf, int size);
+static int  hdlcdev_init(struct mgsl_struct *info);
+static void hdlcdev_exit(struct mgsl_struct *info);
+#endif
+
 /*
  * Defines a BUS descriptor value for the PCI adapter
  * local bus address ranges.
@@ -682,10 +681,10 @@ static void r56_trace_block(struct r56_struct *info,const char* data, int count,
 /*
  * Adapter diagnostic routines
  */
-static BOOLEAN r56_register_test( struct r56_struct *info );
-static BOOLEAN r56_irq_test( struct r56_struct *info );
-static BOOLEAN r56_dma_test( struct r56_struct *info );
-static BOOLEAN r56_memory_test( struct r56_struct *info );
+static bool r56_register_test( struct r56_struct *info );
+static bool r56_irq_test( struct r56_struct *info );
+static bool r56_dma_test( struct r56_struct *info );
+static bool r56_memory_test( struct r56_struct *info );
 static int r56_adapter_test( struct r56_struct *info );
 
 /*
@@ -700,8 +699,8 @@ static struct r56_struct* r56_allocate_device(void);
  * DMA buffer manupulation functions.
  */
 static void r56_free_rx_frame_buffers( struct r56_struct *info, unsigned int StartIndex, unsigned int EndIndex );
-static int  r56_get_rx_frame( struct r56_struct *info );
-static int  r56_get_raw_rx_frame( struct r56_struct *info );
+static bool  r56_get_rx_frame( struct r56_struct *info );
+static bool  r56_get_raw_rx_frame( struct r56_struct *info );
 static void r56_reset_rx_dma_buffers( struct r56_struct *info );
 static void r56_reset_tx_dma_buffers( struct r56_struct *info );
 static int num_free_tx_dma_buffers(struct r56_struct *info);
@@ -721,13 +720,13 @@ static int r56_alloc_intermediate_rxbuffer_memory(struct r56_struct *info);
 static void r56_free_intermediate_rxbuffer_memory(struct r56_struct *info);
 static int r56_alloc_intermediate_txbuffer_memory(struct r56_struct *info);
 static void r56_free_intermediate_txbuffer_memory(struct r56_struct *info);
-static int load_next_tx_holding_buffer(struct r56_struct *info);
+static bool load_next_tx_holding_buffer(struct r56_struct *info);
 static int save_tx_buffer_request(struct r56_struct *info,const char *Buffer, unsigned int BufferSize);
 
 /*
  * Bottom half interrupt handlers
  */
-static void r56_bh_handler(r56_pContext Context);
+static void r56_bh_handler(struct work_struct *work);
 static void r56_bh_receive(struct r56_struct *info);
 static void r56_bh_transmit(struct r56_struct *info);
 static void r56_bh_status(struct r56_struct *info);
@@ -761,6 +760,9 @@ static isr_dispatch_func UscIsrTable[7] =
 /*
  * ioctl call handlers
  */
+static int tiocmget(struct tty_struct *tty);
+static int tiocmset(struct tty_struct *tty,
+		    unsigned int set, unsigned int clear);
 static int r56_get_stats(struct r56_struct * info, struct r56_icount
 	__user *user_icount);
 static int r56_get_params(struct r56_struct * info, R56_PARAMS  __user *user_params);
@@ -774,7 +776,7 @@ static int r56_wait_event(struct r56_struct * info, int __user *mask);
 static int r56_loopmode_send_done( struct r56_struct * info );
 
 /* set non-zero on successful registration with PCI subsystem */
-static int pci_registered;
+static bool pci_registered;
 
 /*
  * Global linked list of route56 devices
@@ -839,7 +841,7 @@ static struct pci_driver route56_pci_driver = {
 	.name		= "route56",
 	.id_table	= route56_pci_tbl,
 	.probe		= route56_init_one,
-	.remove		= __devexit_p(route56_remove_one),
+	.remove		= route56_remove_one,
 };
 
 static struct tty_driver *serial_driver;
@@ -886,6 +888,29 @@ static inline int r56_paranoia_check(struct r56_struct *info,
 	return 0;
 }
 
+/**
+ * line discipline callback wrappers
+ *
+ * The wrappers maintain line discipline references
+ * while calling into the line discipline.
+ *
+ * ldisc_receive_buf  - pass receive data to line discipline
+ */
+
+static void ldisc_receive_buf(struct tty_struct *tty,
+			      const __u8 *data, char *flags, int count)
+{
+	struct tty_ldisc *ld;
+	if (!tty)
+		return;
+	ld = tty_ldisc_ref(tty);
+	if (ld) {
+		if (ld->ops->receive_buf)
+			ld->ops->receive_buf(tty, data, flags, count);
+		tty_ldisc_deref(ld);
+	}
+}
+
 /* r56_stop()		throttle (stop) transmitter
  * 	
  * Arguments:		tty	pointer to tty info structure
@@ -896,7 +921,7 @@ static void r56_stop(struct tty_struct *tty)
 	struct r56_struct *info = (struct r56_struct *)tty->driver_data;
 	unsigned long flags;
 	
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_stop"))
+	if (r56_paranoia_check(info, tty->name, "r56_stop"))
 		return;
 	
 	if ( debug_level >= DEBUG_LEVEL_INFO )
@@ -919,7 +944,7 @@ static void r56_start(struct tty_struct *tty)
 	struct r56_struct *info = (struct r56_struct *)tty->driver_data;
 	unsigned long flags;
 	
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_start"))
+	if (r56_paranoia_check(info, tty->name, "r56_start"))
 		return;
 	
 	if ( debug_level >= DEBUG_LEVEL_INFO )
@@ -959,8 +984,8 @@ static int r56_bh_action(struct r56_struct *info)
 
 	if (!rc) {
 		/* Mark BH routine as complete */
-		info->bh_running   = 0;
-		info->bh_requested = 0;
+		info->bh_running = false;
+		info->bh_requested = false;
 	}
 	
 	spin_unlock_irqrestore(&info->irq_spinlock,flags);
@@ -971,9 +996,10 @@ static int r56_bh_action(struct r56_struct *info)
 /*
  * 	Perform bottom half processing of work items queued by ISR.
  */
-static void r56_bh_handler(r56_pContext Context)
+static void r56_bh_handler(struct work_struct *work)
 {
-	struct r56_struct *info = cpat_contain(Context, struct r56_struct,task);
+	struct r56_struct *info =
+		container_of(work, struct r56_struct,task);
 	int action;
 
 	if (!info)
@@ -1017,7 +1043,7 @@ static void r56_bh_handler(r56_pContext Context)
 
 static void r56_bh_receive(struct r56_struct *info)
 {
-	int (*get_rx_frame)(struct r56_struct *info) =
+	bool (*get_rx_frame)(struct r56_struct *info) =
 		(info->params.mode == R56_MODE_HDLC ? r56_get_rx_frame : r56_get_raw_rx_frame);
 
 	if ( debug_level >= DEBUG_LEVEL_BH )
@@ -1038,7 +1064,7 @@ static void r56_bh_receive(struct r56_struct *info)
 
 static void r56_bh_transmit(struct r56_struct *info)
 {
-	struct tty_struct *tty = info->tty;
+	struct tty_struct *tty = info->port.tty;
 	unsigned long flags;
 	
 	if ( debug_level >= DEBUG_LEVEL_BH )
@@ -1047,7 +1073,7 @@ static void r56_bh_transmit(struct r56_struct *info)
 
 	if (tty) {
 		tty_wakeup(tty);
-		wake_up_interruptible(&tty->write_wait);
+		//wake_up_interruptible(&tty->write_wait);
 	}
 
 	/* if transmitter idle and loopmode_send_done_requested
@@ -1093,7 +1119,7 @@ static void r56_isr_receive_status( struct r56_struct *info )
  		usc_loopmode_active(info) )
  	{
 		++info->icount.rxabort;
-	 	info->loopmode_insert_requested = FALSE;
+	 	info->loopmode_insert_requested = false;
  
  		/* clear CMR:13 to start echoing RxD to TxD */
 		info->cmr_value &= ~BIT13;
@@ -1163,7 +1189,7 @@ static void r56_isr_transmit_status( struct r56_struct *info )
 	else
 		info->icount.txunder++;
 			
-	info->tx_active = 0;
+	info->tx_active = false;
 	info->xmit_cnt = info->xmit_head = info->xmit_tail = 0;
 	del_timer(&info->tx_timer);	
 	
@@ -1173,19 +1199,21 @@ static void r56_isr_transmit_status( struct r56_struct *info )
 			info->serial_signals &= ~SerialSignal_RTS;
 			usc_set_serial_signals( info );
 		}
-		info->drop_rts_on_tx_done = 0;
+		info->drop_rts_on_tx_done = false;
 	}
 
-	if (info->enable_rx_on_tx_done) {
-		usc_start_receiver(info);
-		info->enable_rx_on_tx_done = 0;
+#if R56_GENERIC_HDLC
+	if (info->netcount)
+		hdlcdev_tx_done(info);
+	else 
+#endif
+	{
+		if (info->port.tty->stopped || info->port.tty->hw_stopped) {
+			usc_stop_transmitter(info);
+			return;
+		}
+		info->pending_bh |= BH_TRANSMIT;
 	}
-
-	if (info->tty->stopped || info->tty->hw_stopped) {
-		usc_stop_transmitter(info);
-		return;
-	}
-	info->pending_bh |= BH_TRANSMIT;
 
 }	/* end of r56_isr_transmit_status() */
 
@@ -1239,6 +1267,14 @@ static void r56_isr_io_pin( struct r56_struct *info )
 				info->input_signal_events.dcd_up++;
 			} else
 				info->input_signal_events.dcd_down++;
+#if R56_GENERIC_HDLC
+			if (info->netcount) {
+				if (status & MISCSTATUS_DCD)
+					netif_carrier_on(info->netdev);
+				else
+					netif_carrier_off(info->netdev);
+			}
+#endif
 		}
 		if (status & MISCSTATUS_CTS_LATCHED)
 		{
@@ -1253,29 +1289,29 @@ static void r56_isr_io_pin( struct r56_struct *info )
 		wake_up_interruptible(&info->status_event_wait_q);
 		wake_up_interruptible(&info->event_wait_q);
 
-		if ( (info->flags & ASYNC_CHECK_CD) && 
+		if ( (info->port.flags & ASYNC_CHECK_CD) && 
 		     (status & MISCSTATUS_DCD_LATCHED) ) {
 			if ( debug_level >= DEBUG_LEVEL_ISR )
 				printk("%s CD now %s...", info->device_name,
 				       (status & MISCSTATUS_DCD) ? "on" : "off");
 			if (status & MISCSTATUS_DCD)
-				wake_up_interruptible(&info->open_wait);
+				wake_up_interruptible(&info->port.open_wait);
 			else {
 				if ( debug_level >= DEBUG_LEVEL_ISR )
 					printk("doing serial hangup...");
-				if (info->tty)
-					tty_hangup(info->tty);
+				if (info->port.tty)
+					tty_hangup(info->port.tty);
 			}
 		}
 	
-		if ( (info->flags & ASYNC_CTS_FLOW) && 
+		if (tty_port_cts_enabled(&info->port) &&
 		     (status & MISCSTATUS_CTS_LATCHED) ) {
-			if (info->tty->hw_stopped) {
+			if (info->port.tty->hw_stopped) {
 				if (status & MISCSTATUS_CTS) {
 					if ( debug_level >= DEBUG_LEVEL_ISR )
 						printk("CTS tx start...");
-					if (info->tty)
-						info->tty->hw_stopped = 0;
+					if (info->port.tty)
+						info->port.tty->hw_stopped = 0;
 					usc_start_transmitter(info);
 					info->pending_bh |= BH_TRANSMIT;
 					return;
@@ -1284,8 +1320,8 @@ static void r56_isr_io_pin( struct r56_struct *info )
 				if (!(status & MISCSTATUS_CTS)) {
 					if ( debug_level >= DEBUG_LEVEL_ISR )
 						printk("CTS tx stop...");
-					if (info->tty)
-						info->tty->hw_stopped = 1;
+					if (info->port.tty)
+						info->port.tty->hw_stopped = 1;
 					usc_stop_transmitter(info);
 				}
 			}
@@ -1299,7 +1335,7 @@ static void r56_isr_io_pin( struct r56_struct *info )
 		usc_OutReg( info, SICR,
 			(unsigned short)(usc_InReg(info,SICR) & ~(SICR_TXC_ACTIVE+SICR_TXC_INACTIVE)) );
 		usc_UnlatchIostatusBits( info, MISCSTATUS_TXC_LATCHED );
-		info->irq_occurred = 1;
+		info->irq_occurred = true;
 	}
 
 }	/* end of r56_isr_io_pin() */
@@ -1319,7 +1355,7 @@ static void r56_isr_transmit_data( struct r56_struct *info )
 			
 	usc_ClearIrqPendingBits( info, TRANSMIT_DATA );
 	
-	if (info->tty->stopped || info->tty->hw_stopped) {
+	if (info->port.tty->stopped || info->port.tty->hw_stopped) {
 		usc_stop_transmitter(info);
 		return;
 	}
@@ -1327,7 +1363,7 @@ static void r56_isr_transmit_data( struct r56_struct *info )
 	if ( info->xmit_cnt )
 		usc_load_txfifo( info );
 	else
-		info->tx_active = 0;
+		info->tx_active = false;
 		
 	if (info->xmit_cnt < WAKEUP_CHARS)
 		info->pending_bh |= BH_TRANSMIT;
@@ -1345,10 +1381,11 @@ static void r56_isr_transmit_data( struct r56_struct *info )
  */
 static void r56_isr_receive_data( struct r56_struct *info )
 {
-	int Fifocount, work = 0;
+	int Fifocount;
 	u16 status;
+	int work = 0;
 	unsigned char DataByte;
- 	struct tty_struct *tty = info->tty;
+ 	struct tty_struct *tty = info->port.tty;
  	struct	r56_icount *icount = &info->icount;
 	
 	if ( debug_level >= DEBUG_LEVEL_ISR )	
@@ -1382,8 +1419,8 @@ static void r56_isr_receive_data( struct r56_struct *info )
 			usc_UnlatchRxstatusBits(info,RXSTATUS_ALL);
 		
 		icount->rx++;
-		flag = 0;		
 		
+		flag = 0;
 		if ( status & (RXSTATUS_FRAMING_ERROR + RXSTATUS_PARITY_ERROR +
 				RXSTATUS_OVERRUN + RXSTATUS_BREAK_RECEIVED) ) {
 			printk("rxerr=%04X\n",status);					
@@ -1410,22 +1447,20 @@ static void r56_isr_receive_data( struct r56_struct *info )
 		
 			if (status & RXSTATUS_BREAK_RECEIVED) {
 				flag = TTY_BREAK;
-				if (info->flags & ASYNC_SAK)
+				if (info->port.flags & ASYNC_SAK)
 					do_SAK(tty);
 			} else if (status & RXSTATUS_PARITY_ERROR)
-				flag = TTY_PARITY; 
+				flag = TTY_PARITY;
 			else if (status & RXSTATUS_FRAMING_ERROR)
-				flag = TTY_FRAME; 
+				flag = TTY_FRAME;
 		}	/* end of if (error) */
-		
-		work += cpat_insert_flip_char(tty, DataByte, flag);
-		
+		tty_insert_flip_char(tty, DataByte, flag);
 		if (status & RXSTATUS_OVERRUN) {
 			/* Overrun is special, since it's
 			 * reported immediately, and doesn't
 			 * affect the current character
 			 */
-		     work += cpat_insert_flip_char(tty, 0, TTY_OVERRUN);
+			work += tty_insert_flip_char(tty, 0, TTY_OVERRUN);
 		}
 	}
 
@@ -1435,9 +1470,8 @@ static void r56_isr_receive_data( struct r56_struct *info )
 			icount->parity,icount->frame,icount->overrun);
 	}
 			
-	if ( work )
+	if(work)
 		tty_flip_buffer_push(tty);
-
 }
 
 /* r56_isr_misc()
@@ -1467,7 +1501,7 @@ static void r56_isr_misc( struct r56_struct *info )
 
 		/* schedule BH handler to restart receiver */
 		info->pending_bh |= BH_RECEIVE;
-		info->rx_rcc_underrun = 1;
+		info->rx_rcc_underrun = true;
 	}
 
 	usc_ClearIrqPendingBits( info, MISC );
@@ -1525,7 +1559,7 @@ static void r56_isr_receive_dma( struct r56_struct *info )
 	info->pending_bh |= BH_RECEIVE;
 	
 	if ( status & BIT3 ) {
-		info->rx_overflow = 1;
+		info->rx_overflow = true;
 		info->icount.buf_overrun++;
 	}
 
@@ -1591,13 +1625,12 @@ static void r56_isr_transmit_dma( struct r56_struct *info )
  * 
  * 	irq		interrupt number that caused interrupt
  * 	dev_id		device ID supplied during interrupt registration
- * 	regs		interrupted processor context
  * 	
  * Return Value: None
  */
-static irqreturn_t r56_interrupt(int irq, void *dev_id, struct pt_regs *regs)
+static irqreturn_t r56_interrupt(int irq, void *dev_id)
 {
-	struct r56_struct * info;
+	struct r56_struct * info = (struct r56_struct *)dev_id;
 	u16 UscVector;
 	u16 DmaVector;
 
@@ -1605,19 +1638,6 @@ static irqreturn_t r56_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 		printk("%s(%d):r56_interrupt(%d)entry.\n",
 			__FILE__,__LINE__,irq);
 
-	info = (struct r56_struct *)dev_id;	
-
-	// Check and see if the interrupt was even caused by us
-	if (!info || !info->all_resources_claimed)
-	{
-		if (debug_level >= DEBUG_LEVEL_ISR)
-		{
-			printk("%s(%d):r56_interrupt(%d)exit - not fully initialized.\n",
-				__FILE__,__LINE__,irq);
-		}
-		return IRQ_NONE;
-	}
-		
 	spin_lock(&info->irq_spinlock);
 
 //	for(;;) {
@@ -1661,7 +1681,7 @@ static irqreturn_t r56_interrupt(int irq, void *dev_id, struct pt_regs *regs)
 			printk("%s(%d):%s queueing bh task.\n",
 				__FILE__,__LINE__,info->device_name);
 		schedule_work(&info->task);
-		info->bh_requested = 1;
+		info->bh_requested = true;
 	}
 
 	spin_unlock(&info->irq_spinlock);
@@ -1687,7 +1707,7 @@ static int startup(struct r56_struct * info)
 	if ( debug_level >= DEBUG_LEVEL_INFO )
 		printk("%s(%d):r56_startup(%s)\n",__FILE__,__LINE__,info->device_name);
 		
-	if (info->flags & ASYNC_INITIALIZED)
+	if (info->port.flags & ASYNC_INITIALIZED)
 		return 0;
 	
 	if (!info->xmit_buf) {
@@ -1704,9 +1724,7 @@ static int startup(struct r56_struct * info)
 	
 	memset(&info->icount, 0, sizeof(info->icount));
 
-	init_timer(&info->tx_timer);
-	info->tx_timer.data = (unsigned long)info;
-	info->tx_timer.function = r56_tx_timeout;
+	setup_timer(&info->tx_timer, r56_tx_timeout, (unsigned long)info);
 	
 	/* Allocate and claim adapter resources */
 	retval = r56_claim_resources(info);
@@ -1716,8 +1734,8 @@ static int startup(struct r56_struct * info)
 		retval = r56_adapter_test(info);
 		
 	if ( retval ) {
-  		if (capable(CAP_SYS_ADMIN) && info->tty)
-			set_bit(TTY_IO_ERROR, &info->tty->flags);
+  		if (capable(CAP_SYS_ADMIN) && info->port.tty)
+			set_bit(TTY_IO_ERROR, &info->port.tty->flags);
 		r56_release_resources(info);
   		return retval;
   	}
@@ -1725,10 +1743,10 @@ static int startup(struct r56_struct * info)
 	/* program hardware for current parameters */
 	r56_change_params(info);
 	
-	if (info->tty)
-		clear_bit(TTY_IO_ERROR, &info->tty->flags);
+	if (info->port.tty)
+		clear_bit(TTY_IO_ERROR, &info->port.tty->flags);
 
-	info->flags |= ASYNC_INITIALIZED;
+	info->port.flags |= ASYNC_INITIALIZED;
 	
 	return 0;
 	
@@ -1745,7 +1763,7 @@ static void shutdown(struct r56_struct * info)
 {
 	unsigned long flags;
 	
-	if (!(info->flags & ASYNC_INITIALIZED))
+	if (!(info->port.flags & ASYNC_INITIALIZED))
 		return;
 
 	if (debug_level >= DEBUG_LEVEL_INFO)
@@ -1757,7 +1775,7 @@ static void shutdown(struct r56_struct * info)
 	wake_up_interruptible(&info->status_event_wait_q);
 	wake_up_interruptible(&info->event_wait_q);
 
-	del_timer(&info->tx_timer);	
+	del_timer_sync(&info->tx_timer);
 
 	if (info->xmit_buf) {
 		free_page((unsigned long) info->xmit_buf);
@@ -1771,30 +1789,31 @@ static void shutdown(struct r56_struct * info)
 	usc_DisableInterrupts(info,RECEIVE_DATA + RECEIVE_STATUS +
 		TRANSMIT_DATA + TRANSMIT_STATUS + IO_PIN + MISC );
 	usc_DisableDmaInterrupts(info,DICR_MASTER + DICR_TRANSMIT + DICR_RECEIVE);
-	
+
 	/* Disable DMAEN (Port 7, Bit 14) */
 	/* This disconnects the DMA request signal from the ISA bus */
 	/* on the ISA adapter. This has no effect for the PCI adapter */
 	usc_OutReg(info, PCR, (u16)((usc_InReg(info, PCR) | BIT15) | BIT14));
-	
+
 	/* Disable INTEN (Port 6, Bit12) */
 	/* This disconnects the IRQ request signal to the ISA bus */
 	/* on the ISA adapter. This has no effect for the PCI adapter */
 	usc_OutReg(info, PCR, (u16)((usc_InReg(info, PCR) | BIT13) | BIT12));
-	
- 	if (!info->tty || C_HUPCL(info->tty)) {
+
+	if (!info->port.tty || info->port.tty->termios.c_cflag & HUPCL) {
  		info->serial_signals &= ~(SerialSignal_DTR + SerialSignal_RTS);
 		usc_set_serial_signals(info);
 	}
-	
+
 	spin_unlock_irqrestore(&info->irq_spinlock,flags);
 
-	if (info->tty)
-		set_bit(TTY_IO_ERROR, &info->tty->flags);
-
-	info->flags &= ~ASYNC_INITIALIZED;
-	
 	r56_release_resources(info);	
+	
+	if (info->port.tty)
+		set_bit(TTY_IO_ERROR, &info->port.tty->flags);
+
+	info->port.flags &= ~ASYNC_INITIALIZED;
+	
 }	/* end of shutdown() */
 
 static void r56_program_hw(struct r56_struct *info)
@@ -1825,7 +1844,7 @@ static void r56_program_hw(struct r56_struct *info)
 	usc_EnableInterrupts(info, IO_PIN);
 	usc_get_serial_signals(info);
 		
-	if (info->netcount || C_CREAD(info->tty))
+	if (info->netcount || info->port.tty->termios.c_cflag & CREAD)
 		usc_start_receiver(info);
 		
 	spin_unlock_irqrestore(&info->irq_spinlock,flags);
@@ -1837,22 +1856,15 @@ static void r56_change_params(struct r56_struct *info)
 {
 	unsigned cflag;
 	int bits_per_char;
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
-	if (!info->tty || !info->tty->termios)
-#else
-	if (!info->tty)
-#endif
+
+	if (!info->port.tty)
 		return;
 		
 	if (debug_level >= DEBUG_LEVEL_INFO)
 		printk("%s(%d):r56_change_params(%s)\n",
 			 __FILE__,__LINE__, info->device_name );
-
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
-	cflag = info->tty->termios->c_cflag;
-#else
-	cflag = info->tty->termios.c_cflag;
-#endif
+			 
+	cflag = info->port.tty->termios.c_cflag;
 
 	/* if B0 rate (hangup) specified then negate DTR and RTS */
 	/* otherwise assert DTR and RTS, but we want to ignore the
@@ -1865,14 +1877,14 @@ static void r56_change_params(struct r56_struct *info)
 	
 	/* byte size and parity */
 	
-	switch (cflag & CSIZE)
-	{
+	switch (cflag & CSIZE) {
 	      case CS5: info->params.data_bits = 5; break;
 	      case CS6: info->params.data_bits = 6; break;
 	      case CS7: info->params.data_bits = 7; break;
 	      case CS8: info->params.data_bits = 8; break;
+	      /* Never happens, but GCC is too dumb to figure it out */
 	      default:  info->params.data_bits = 7; break;
-	}
+	      }
 	      
 	if (cflag & CSTOPB)
 		info->params.stop_bits = 2;
@@ -1902,7 +1914,7 @@ static void r56_change_params(struct r56_struct *info)
 	 * current data rate.
 	 */
 	if (info->params.data_rate <= 460800)
-		info->params.data_rate = tty_get_baud_rate(info->tty);
+		info->params.data_rate = tty_get_baud_rate(info->port.tty);
 	
 	if ( info->params.data_rate ) {
 		info->timeout = (32*HZ*bits_per_char) / 
@@ -1911,31 +1923,31 @@ static void r56_change_params(struct r56_struct *info)
 	info->timeout += HZ/50;		/* Add .02 seconds of slop */
 
 	if (cflag & CRTSCTS)
-		info->flags |= ASYNC_CTS_FLOW;
+		info->port.flags |= ASYNC_CTS_FLOW;
 	else
-		info->flags &= ~ASYNC_CTS_FLOW;
+		info->port.flags &= ~ASYNC_CTS_FLOW;
 		
 	if (cflag & CLOCAL)
-		info->flags &= ~ASYNC_CHECK_CD;
+		info->port.flags &= ~ASYNC_CHECK_CD;
 	else
-		info->flags |= ASYNC_CHECK_CD;
+		info->port.flags |= ASYNC_CHECK_CD;
 
 	/* process tty input control flags */
 	
 	info->read_status_mask = RXSTATUS_OVERRUN;
-	if (I_INPCK(info->tty))
+	if (I_INPCK(info->port.tty))
 		info->read_status_mask |= RXSTATUS_PARITY_ERROR | RXSTATUS_FRAMING_ERROR;
- 	if (I_BRKINT(info->tty) || I_PARMRK(info->tty))
+ 	if (I_BRKINT(info->port.tty) || I_PARMRK(info->port.tty))
  		info->read_status_mask |= RXSTATUS_BREAK_RECEIVED;
 	
-	if (I_IGNPAR(info->tty))
+	if (I_IGNPAR(info->port.tty))
 		info->ignore_status_mask |= RXSTATUS_PARITY_ERROR | RXSTATUS_FRAMING_ERROR;
-	if (I_IGNBRK(info->tty)) {
+	if (I_IGNBRK(info->port.tty)) {
 		info->ignore_status_mask |= RXSTATUS_BREAK_RECEIVED;
 		/* If ignoring parity and break indicators, ignore 
 		 * overruns too.  (For real raw support).
 		 */
-		if (I_IGNPAR(info->tty))
+		if (I_IGNPAR(info->port.tty))
 			info->ignore_status_mask |= RXSTATUS_OVERRUN;
 	}
 
@@ -1952,51 +1964,37 @@ static void r56_change_params(struct r56_struct *info)
  * 		
  * Return Value:	None
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 26)
-static void r56_put_char(struct tty_struct *tty, unsigned char ch)
-#else
 static int r56_put_char(struct tty_struct *tty, unsigned char ch)
-#endif
 {
 	struct r56_struct *info = (struct r56_struct *)tty->driver_data;
 	unsigned long flags;
+	int ret = 0;
 
 	if ( debug_level >= DEBUG_LEVEL_INFO ) {
 		printk( "%s(%d):r56_put_char(%d) on %s\n",
 			__FILE__,__LINE__,ch,info->device_name);
 	}		
 	
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_put_char"))
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 26)
-		return;
-#else
+	if (r56_paranoia_check(info, tty->name, "r56_put_char"))
 		return 0;
-#endif
 
-	if (!tty || !info->xmit_buf)
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 26)
-		return;
-#else
+	if (!info->xmit_buf)
 		return 0;
-#endif
 
-	spin_lock_irqsave(&info->irq_spinlock,flags);
+	spin_lock_irqsave(&info->irq_spinlock, flags);
 	
 	if ( (info->params.mode == R56_MODE_ASYNC ) || !info->tx_active ) {
-	
 		if (info->xmit_cnt < SERIAL_XMIT_SIZE - 1) {
 			info->xmit_buf[info->xmit_head++] = ch;
 			info->xmit_head &= SERIAL_XMIT_SIZE-1;
 			info->xmit_cnt++;
+			ret = 1;
 		}
 	}
+	spin_unlock_irqrestore(&info->irq_spinlock, flags);
+	return ret;
 	
-	spin_unlock_irqrestore(&info->irq_spinlock,flags);
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 26)
-	return 1;
-#endif
-}	/* end of r56_put_char() */
+}	/* end of mgsl_put_char() */
 
 /* r56_flush_chars()
  * 
@@ -2015,7 +2013,7 @@ static void r56_flush_chars(struct tty_struct *tty)
 		printk( "%s(%d):r56_flush_chars() entry on %s xmit_cnt=%d\n",
 			__FILE__,__LINE__,info->device_name,info->xmit_cnt);
 	
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_flush_chars"))
+	if (r56_paranoia_check(info, tty->name, "r56_flush_chars"))
 		return;
 
 	if (info->xmit_cnt <= 0 || tty->stopped || tty->hw_stopped ||
@@ -2067,10 +2065,10 @@ static int r56_write(struct tty_struct *tty,
 		printk( "%s(%d):r56_write(%s) count=%d\n",
 			__FILE__,__LINE__,info->device_name,count);
 	
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_write"))
+	if (r56_paranoia_check(info, tty->name, "r56_write"))
 		goto cleanup;
 
-	if (!tty || !info->xmit_buf)
+	if (!info->xmit_buf)
 		goto cleanup;
 
 	if ( info->params.mode == R56_MODE_HDLC ||
@@ -2137,9 +2135,7 @@ static int r56_write(struct tty_struct *tty,
 			info->xmit_cnt = count;
 			r56_load_tx_dma_buffer(info,buf,count);
 		}
-	} 
-	// Operating in ASYNC mode!
-	else {
+	} else {
 		while (1) {
 			spin_lock_irqsave(&info->irq_spinlock,flags);
 			c = min_t(int, count,
@@ -2187,7 +2183,7 @@ static int r56_write_room(struct tty_struct *tty)
 	struct r56_struct *info = (struct r56_struct *)tty->driver_data;
 	int	ret;
 				
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_write_room"))
+	if (r56_paranoia_check(info, tty->name, "r56_write_room"))
 		return 0;
 	ret = SERIAL_XMIT_SIZE - info->xmit_cnt - 1;
 	if (ret < 0)
@@ -2225,7 +2221,7 @@ static int r56_chars_in_buffer(struct tty_struct *tty)
 		printk("%s(%d):r56_chars_in_buffer(%s)\n",
 			 __FILE__,__LINE__, info->device_name );
 			 
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_chars_in_buffer"))
+	if (r56_paranoia_check(info, tty->name, "r56_chars_in_buffer"))
 		return 0;
 		
 	if (debug_level >= DEBUG_LEVEL_INFO)
@@ -2260,7 +2256,7 @@ static void r56_flush_buffer(struct tty_struct *tty)
 		printk("%s(%d):r56_flush_buffer(%s) entry\n",
 			 __FILE__,__LINE__, info->device_name );
 	
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_flush_buffer"))
+	if (r56_paranoia_check(info, tty->name, "r56_flush_buffer"))
 		return;
 		
 	spin_lock_irqsave(&info->irq_spinlock,flags); 
@@ -2268,7 +2264,7 @@ static void r56_flush_buffer(struct tty_struct *tty)
 	del_timer(&info->tx_timer);	
 	spin_unlock_irqrestore(&info->irq_spinlock,flags);
 	
-	wake_up_interruptible(&tty->write_wait);
+	//wake_up_interruptible(&tty->write_wait);
 	tty_wakeup(tty);
 }
 
@@ -2289,7 +2285,7 @@ static void r56_send_xchar(struct tty_struct *tty, char ch)
 		printk("%s(%d):r56_send_xchar(%s,%d)\n",
 			 __FILE__,__LINE__, info->device_name, ch );
 			 
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_send_xchar"))
+	if (r56_paranoia_check(info, tty->name, "r56_send_xchar"))
 		return;
 
 	info->x_char = ch;
@@ -2318,13 +2314,13 @@ static void r56_throttle(struct tty_struct * tty)
 		printk("%s(%d):r56_throttle(%s) entry\n",
 			 __FILE__,__LINE__, info->device_name );
 
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_throttle"))
+	if (r56_paranoia_check(info, tty->name, "r56_throttle"))
 		return;
 	
 	if (I_IXOFF(tty))
 		r56_send_xchar(tty, STOP_CHAR(tty));
- 
- 	if (C_CRTSCTS(tty)) {
+
+	if (tty->termios.c_cflag & CRTSCTS) {
 		spin_lock_irqsave(&info->irq_spinlock,flags);
 		info->serial_signals &= ~SerialSignal_RTS;
 	 	usc_set_serial_signals(info);
@@ -2348,7 +2344,7 @@ static void r56_unthrottle(struct tty_struct * tty)
 		printk("%s(%d):r56_unthrottle(%s) entry\n",
 			 __FILE__,__LINE__, info->device_name );
 
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_unthrottle"))
+	if (r56_paranoia_check(info, tty->name, "r56_unthrottle"))
 		return;
 	
 	if (I_IXOFF(tty)) {
@@ -2357,8 +2353,8 @@ static void r56_unthrottle(struct tty_struct * tty)
 		else
 			r56_send_xchar(tty, START_CHAR(tty));
 	}
-	
- 	if (C_CRTSCTS(tty)) {
+
+	if (tty->termios.c_cflag & CRTSCTS) {
 		spin_lock_irqsave(&info->irq_spinlock,flags);
 		info->serial_signals |= SerialSignal_RTS;
 	 	usc_set_serial_signals(info);
@@ -2387,7 +2383,9 @@ static int r56_get_stats(struct r56_struct * info, struct r56_icount __user *use
 	if (!user_icount) {
 		memset(&info->icount, 0, sizeof(info->icount));
 	} else {
+		mutex_lock(&info->port.mutex);
 		COPY_TO_USER(err, user_icount, &info->icount, sizeof(struct r56_icount));
+		mutex_unlock(&info->port.mutex);
 		if (err)
 			return -EFAULT;
 	}
@@ -2412,7 +2410,9 @@ static int r56_get_params(struct r56_struct * info, R56_PARAMS __user *user_para
 		printk("%s(%d):r56_get_params(%s)\n",
 			 __FILE__,__LINE__, info->device_name);
 			
+	mutex_lock(&info->port.mutex);
 	COPY_TO_USER(err,user_params, &info->params, sizeof(R56_PARAMS));
+	mutex_unlock(&info->port.mutex);
 	if (err) {
 		if ( debug_level >= DEBUG_LEVEL_INFO )
 			printk( "%s(%d):r56_get_params(%s) user buffer copy failed\n",
@@ -2452,11 +2452,13 @@ static int r56_set_params(struct r56_struct * info, R56_PARAMS __user *new_param
 		return -EFAULT;
 	}
 	
+	mutex_lock(&info->port.mutex);
 	spin_lock_irqsave(&info->irq_spinlock,flags);
 	memcpy(&info->params,&tmp_params,sizeof(R56_PARAMS));
 	spin_unlock_irqrestore(&info->irq_spinlock,flags);
 	
  	r56_change_params(info);
+	mutex_unlock(&info->port.mutex);
 	
 	return 0;
 	
@@ -2827,11 +2829,7 @@ static int modem_input_wait(struct r56_struct *info,int arg)
 
 /* return the state of the serial control and status signals
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
-static int tiocmget(struct tty_struct *tty, struct file *file)
-#else
 static int tiocmget(struct tty_struct *tty)
-#endif
 {
 	struct r56_struct *info = (struct r56_struct *)tty->driver_data;
 	unsigned int result;
@@ -2856,13 +2854,8 @@ static int tiocmget(struct tty_struct *tty)
 
 /* set modem control signals (DTR/RTS)
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
-static int tiocmset(struct tty_struct *tty, struct file *file,
-		    unsigned int set, unsigned int clear)
-#else
 static int tiocmset(struct tty_struct *tty,
-		    unsigned int set, unsigned int clear)
-#endif
+				    unsigned int set, unsigned int clear)
 {
 	struct r56_struct *info = (struct r56_struct *)tty->driver_data;
  	unsigned long flags;
@@ -2880,17 +2873,9 @@ static int tiocmset(struct tty_struct *tty,
 	if (clear & TIOCM_DTR)
 		info->serial_signals &= ~SerialSignal_DTR;
 
-	// This was causing a seg fault in PPPD because the resources had been
-	// released before an ioctl call somehow, but this seems to fix it.
-	// Just make sure you claim/release outside the spinlock.
-	if (info->count++ < 1) r56_claim_resources(info);
 	spin_lock_irqsave(&info->irq_spinlock,flags);
-
-	// Hardware change
  	usc_set_serial_signals(info);
-
 	spin_unlock_irqrestore(&info->irq_spinlock,flags);
-	if (info->count-- == 1) r56_release_resources(info);
 
 	return 0;
 }
@@ -2899,13 +2884,9 @@ static int tiocmset(struct tty_struct *tty,
  *
  * Arguments:		tty		pointer to tty instance data
  *			break_state	-1=set break condition, 0=clear
- * Return Value:	None
+ * Return Value:	error code
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 27)
-static void r56_break(struct tty_struct *tty, int break_state)
-#else
 static int r56_break(struct tty_struct *tty, int break_state)
-#endif
 {
 	struct r56_struct * info = (struct r56_struct *)tty->driver_data;
 	unsigned long flags;
@@ -2914,12 +2895,8 @@ static int r56_break(struct tty_struct *tty, int break_state)
 		printk("%s(%d):r56_break(%s,%d)\n",
 			 __FILE__,__LINE__, info->device_name, break_state);
 			 
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_break"))
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 27)
-		return;
-#else
+	if (r56_paranoia_check(info, tty->name, "r56_break"))
 		return -EINVAL;
-#endif
 
 	spin_lock_irqsave(&info->irq_spinlock,flags);
  	if (break_state == -1)
@@ -2927,27 +2904,52 @@ static int r56_break(struct tty_struct *tty, int break_state)
 	else 
 		usc_OutReg(info,IOCR,(u16)(usc_InReg(info,IOCR) & ~BIT7));
 	spin_unlock_irqrestore(&info->irq_spinlock,flags);
-	
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(2, 6, 27)
 	return 0;
-#endif
 }	/* end of r56_break() */
+
+/*
+ * Get counter of input serial line interrupts (DCD,RI,DSR,CTS)
+ * Return: write counters to the user passed counter struct
+ * NB: both 1->0 and 0->1 transitions are counted except for
+ *     RI where only 0->1 is counted.
+ */
+static int r56_get_icount(struct tty_struct *tty,
+				struct serial_icounter_struct *icount)
+
+{
+	struct r56_struct * info = tty->driver_data;
+	struct r56_icount cnow;	/* kernel counter temps */
+	unsigned long flags;
+
+	spin_lock_irqsave(&info->irq_spinlock,flags);
+	cnow = info->icount;
+	spin_unlock_irqrestore(&info->irq_spinlock,flags);
+
+	icount->cts = cnow.cts;
+	icount->dsr = cnow.dsr;
+	icount->rng = cnow.rng;
+	icount->dcd = cnow.dcd;
+	icount->rx = cnow.rx;
+	icount->tx = cnow.tx;
+	icount->frame = cnow.frame;
+	icount->overrun = cnow.overrun;
+	icount->parity = cnow.parity;
+	icount->brk = cnow.brk;
+	icount->buf_overrun = cnow.buf_overrun;
+	return 0;
+}
 
 /* r56_ioctl()	Service an IOCTL request
  * 	
  * Arguments:
  * 
  * 	tty	pointer to tty instance data
- * 	file	pointer to associated file object for device
  * 	cmd	IOCTL command code
  * 	arg	command argument/context
  * 	
  * Return Value:	0 if success, otherwise error code
  */
 static int r56_ioctl(struct tty_struct *tty, 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
-	struct file * file,
-#endif
 		    unsigned int cmd, unsigned long arg)
 {
 	struct r56_struct * info = (struct r56_struct *)tty->driver_data;
@@ -2956,11 +2958,11 @@ static int r56_ioctl(struct tty_struct *tty,
 		printk("%s(%d):r56_ioctl %s cmd=%08X\n", __FILE__,__LINE__,
 			info->device_name, cmd );
 	
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_ioctl"))
+	if (r56_paranoia_check(info, tty->name, "r56_ioctl"))
 		return -ENODEV;
 
 	if ((cmd != TIOCGSERIAL) && (cmd != TIOCSSERIAL) &&
-	    (cmd != TIOCMIWAIT) && (cmd != TIOCGICOUNT)) {
+	    (cmd != TIOCMIWAIT)) {
 		if (tty->flags & (1 << TTY_IO_ERROR))
 		    return -EIO;
 	}
@@ -2970,14 +2972,7 @@ static int r56_ioctl(struct tty_struct *tty,
 
 static int r56_ioctl_common(struct r56_struct *info, unsigned int cmd, unsigned long arg)
 {
-	int error;
-	struct r56_icount cnow;	/* kernel counter temps */
 	void __user *argp = (void __user *)arg;
-	struct serial_icounter_struct __user *p_cuser;	/* user space */
-	unsigned long flags;
-
-	error = cpat_tiocm((void*)info, cmd, arg);
-	if (error >= 0) return error;
 
 	switch (cmd) {
 		case R56_IOCGPARAMS:
@@ -3000,54 +2995,12 @@ static int r56_ioctl_common(struct r56_struct *info, unsigned int cmd, unsigned 
 			return r56_wait_event(info, argp);
 		case R56_IOCLOOPTXDONE:
 			return r56_loopmode_send_done(info);
-/**		case R56_IOCCLRMODCOUNT:
-			while(MOD_IN_USE)
-				MOD_DEC_USE_COUNT;
-			return 0;
-		case R56_IOCSIF:
-			 outb(arg,info->io_base+5);
-			 return 1;
-**/
 		/* Wait for modem input (DCD,RI,DSR,CTS) change
 		 * as specified by mask in arg (TIOCM_RNG/DSR/CD/CTS)
 		 */
 		case TIOCMIWAIT:
 			return modem_input_wait(info,(int)arg);
 
-		/* 
-		 * Get counter of input serial line interrupts (DCD,RI,DSR,CTS)
-		 * Return: write counters to the user passed counter struct
-		 * NB: both 1->0 and 0->1 transitions are counted except for
-		 *     RI where only 0->1 is counted.
-		 */
-		case TIOCGICOUNT:
-			spin_lock_irqsave(&info->irq_spinlock,flags);
-			cnow = info->icount;
-			spin_unlock_irqrestore(&info->irq_spinlock,flags);
-			p_cuser = argp;
-			PUT_USER(error,cnow.cts, &p_cuser->cts);
-			if (error) return error;
-			PUT_USER(error,cnow.dsr, &p_cuser->dsr);
-			if (error) return error;
-			PUT_USER(error,cnow.rng, &p_cuser->rng);
-			if (error) return error;
-			PUT_USER(error,cnow.dcd, &p_cuser->dcd);
-			if (error) return error;
-			PUT_USER(error,cnow.rx, &p_cuser->rx);
-			if (error) return error;
-			PUT_USER(error,cnow.tx, &p_cuser->tx);
-			if (error) return error;
-			PUT_USER(error,cnow.frame, &p_cuser->frame);
-			if (error) return error;
-			PUT_USER(error,cnow.overrun, &p_cuser->overrun);
-			if (error) return error;
-			PUT_USER(error,cnow.parity, &p_cuser->parity);
-			if (error) return error;
-			PUT_USER(error,cnow.brk, &p_cuser->brk);
-			if (error) return error;
-			PUT_USER(error,cnow.buf_overrun, &p_cuser->buf_overrun);
-			if (error) return error;
-			return 0;
 		default:
 			return -ENOIOCTLCMD;
 	}
@@ -3072,25 +3025,13 @@ static void r56_set_termios(struct tty_struct *tty, struct ktermios *old_termios
 	
 	if (debug_level >= DEBUG_LEVEL_INFO)
 		printk("%s(%d):r56_set_termios %s\n", __FILE__,__LINE__,
-			(cpat_pdriver(tty))->name );
+			tty->driver->name );
 	
-	/* just return if nothing has changed */
-	if (
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 39)
-		(tty->termios->c_cflag == old_termios->c_cflag)
-		&& (RELEVANT_IFLAG(tty->termios->c_iflag) == RELEVANT_IFLAG(old_termios->c_iflag))
-#else
-		(tty->termios.c_cflag == old_termios->c_cflag)
-		&& (RELEVANT_IFLAG(tty->termios.c_iflag) == RELEVANT_IFLAG(old_termios->c_iflag))
-#endif
-	)
-	  return;
-
 	r56_change_params(info);
 
 	/* Handle transition to B0 status */
 	if (old_termios->c_cflag & CBAUD &&
-	    !(C_BAUD(tty))) {
+	    !(tty->termios.c_cflag & CBAUD)) {
 		info->serial_signals &= ~(SerialSignal_RTS + SerialSignal_DTR);
 		spin_lock_irqsave(&info->irq_spinlock,flags);
 	 	usc_set_serial_signals(info);
@@ -3099,9 +3040,9 @@ static void r56_set_termios(struct tty_struct *tty, struct ktermios *old_termios
 	
 	/* Handle transition away from B0 status */
 	if (!(old_termios->c_cflag & CBAUD) &&
-	    C_BAUD(tty)) {
+	    tty->termios.c_cflag & CBAUD) {
 		info->serial_signals |= SerialSignal_DTR;
- 		if (!(C_CRTSCTS(tty)) || 
+ 		if (!(tty->termios.c_cflag & CRTSCTS) || 
  		    !test_bit(TTY_THROTTLED, &tty->flags)) {
 			info->serial_signals |= SerialSignal_RTS;
  		}
@@ -3112,7 +3053,7 @@ static void r56_set_termios(struct tty_struct *tty, struct ktermios *old_termios
 	
 	/* Handle turning off CRTSCTS */
 	if (old_termios->c_cflag & CRTSCTS &&
-	    !(C_CRTSCTS(tty))) {
+	    !(tty->termios.c_cflag & CRTSCTS)) {
 		tty->hw_stopped = 0;
 		r56_start(tty);
 	}
@@ -3135,81 +3076,32 @@ static void r56_close(struct tty_struct *tty, struct file * filp)
 {
 	struct r56_struct * info = (struct r56_struct *)tty->driver_data;
 
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_close"))
+	if (r56_paranoia_check(info, tty->name, "r56_close"))
 		return;
 	
 	if (debug_level >= DEBUG_LEVEL_INFO)
 		printk("%s(%d):r56_close(%s) entry, count=%d\n",
-			 __FILE__,__LINE__, info->device_name, info->count);
-			 
-	if (!info->count)
-		return;
+			 __FILE__,__LINE__, info->device_name, info->port.count);
 
-	if (tty_hung_up_p(filp))
+	if (tty_port_close_start(&info->port, tty, filp) == 0)			 
 		goto cleanup;
-			
-	if ((tty->count == 1) && (info->count != 1)) {
-		/*
-		 * tty->count is 1 and the tty structure will be freed.
-		 * info->count should be one in this case.
-		 * if it's not, correct it so that the port is shutdown.
-		 */
-		printk("r56_close: bad refcount; tty->count is 1, "
-		       "info->count is %d\n", info->count);
-		info->count = 1;
-	}
-	
-	info->count--;
-	
-	/* if at least one open remaining, leave hardware active */
-	if (info->count)
-		goto cleanup;
-	
-	info->flags |= ASYNC_CLOSING;
-	
-	/* set tty->closing to notify line discipline to 
-	 * only process XON/XOFF characters. Only the N_TTY
-	 * discipline appears to use this (ppp does not).
-	 */
-	tty->closing = 1;
-	
-	/* wait for transmit data to clear all layers */
-	
-	if (info->closing_wait != ASYNC_CLOSING_WAIT_NONE) {
-		if (debug_level >= DEBUG_LEVEL_INFO)
-			printk("%s(%d):r56_close(%s) calling tty_wait_until_sent\n",
-				 __FILE__,__LINE__, info->device_name );
-		tty_wait_until_sent(tty, info->closing_wait);
-	}
-		
- 	if (info->flags & ASYNC_INITIALIZED)
+
+	mutex_lock(&info->port.mutex);
+ 	if (info->port.flags & ASYNC_INITIALIZED)
  		r56_wait_until_sent(tty, info->timeout);
-
-	if ((cpat_pdriver_ops(tty))->flush_buffer)
-		(cpat_pdriver_ops(tty))->flush_buffer(tty);
-
+	r56_flush_buffer(tty);
+	//if ((cpat_pdriver_ops(tty))->flush_buffer)
+	//	(cpat_pdriver_ops(tty))->flush_buffer(tty);
 	tty_ldisc_flush(tty);
-		
 	shutdown(info);
-	
-	tty->closing = 0;
-	info->tty = NULL;
-	
-	if (info->blocked_open) {
-		if (info->close_delay) {
-			msleep_interruptible(jiffies_to_msecs(info->close_delay));
-		}
-		wake_up_interruptible(&info->open_wait);
-	}
-	
-	info->flags &= ~(ASYNC_NORMAL_ACTIVE|ASYNC_CLOSING);
-			 
-	wake_up_interruptible(&info->close_wait);
-	
+	mutex_unlock(&info->port.mutex);
+
+	tty_port_close_end(&info->port, tty);	
+	info->port.tty = NULL;
 cleanup:			
 	if (debug_level >= DEBUG_LEVEL_INFO)
 		printk("%s(%d):r56_close(%s) exit, count=%d\n", __FILE__,__LINE__,
-			(cpat_pdriver(tty))->name, info->count);
+			tty->driver->name, info->port.count);
 			
 }	/* end of r56_close() */
 
@@ -3236,10 +3128,10 @@ static void r56_wait_until_sent(struct tty_struct *tty, int timeout)
 		printk("%s(%d):r56_wait_until_sent(%s) entry\n",
 			 __FILE__,__LINE__, info->device_name );
       
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_wait_until_sent"))
+	if (r56_paranoia_check(info, tty->name, "r56_wait_until_sent"))
 		return;
 
-	if (!(info->flags & ASYNC_INITIALIZED))
+	if (!(info->port.flags & ASYNC_INITIALIZED))
 		goto exit;
 	 
 	orig_jiffies = jiffies;
@@ -3249,7 +3141,7 @@ static void r56_wait_until_sent(struct tty_struct *tty, int timeout)
 	 * interval should also be less than the timeout.
 	 * Note: use tight timings here to satisfy the NIST-PCTS.
 	 */ 
-       
+
 	if ( info->params.data_rate ) {
 	       	char_time = info->timeout/(32 * 5);
 		if (!char_time)
@@ -3303,19 +3195,51 @@ static void r56_hangup(struct tty_struct *tty)
 		printk("%s(%d):r56_hangup(%s)\n",
 			 __FILE__,__LINE__, info->device_name );
 			 
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_hangup"))
+	if (r56_paranoia_check(info, tty->name, "r56_hangup"))
 		return;
 
 	r56_flush_buffer(tty);
 	shutdown(info);
 	
-	info->count = 0;	
-	info->flags &= ~ASYNC_NORMAL_ACTIVE;
-	info->tty = NULL;
+	info->port.count = 0;	
+	info->port.flags &= ~ASYNC_NORMAL_ACTIVE;
+	info->port.tty = NULL;
 
-	wake_up_interruptible(&info->open_wait);
+	wake_up_interruptible(&info->port.open_wait);
 	
 }	/* end of r56_hangup() */
+
+/*
+ * carrier_raised()
+ *
+ *	Return true if carrier is raised
+ */
+
+static int carrier_raised(struct tty_port *port)
+{
+	unsigned long flags;
+	struct r56_struct *info = container_of(port, struct r56_struct, port);
+	
+	spin_lock_irqsave(&info->irq_spinlock, flags);
+ 	usc_get_serial_signals(info);
+	spin_unlock_irqrestore(&info->irq_spinlock, flags);
+	return (info->serial_signals & SerialSignal_DCD) ? 1 : 0;
+}
+
+static void dtr_rts(struct tty_port *port, int on)
+{
+	struct r56_struct *info = container_of(port, struct r56_struct, port);
+	unsigned long flags;
+
+	spin_lock_irqsave(&info->irq_spinlock,flags);
+	if (on)
+		info->serial_signals |= SerialSignal_RTS + SerialSignal_DTR;
+	else
+		info->serial_signals &= ~(SerialSignal_RTS + SerialSignal_DTR);
+ 	usc_set_serial_signals(info);
+	spin_unlock_irqrestore(&info->irq_spinlock,flags);
+}
+
 
 /* block_til_ready()
  * 
@@ -3335,71 +3259,63 @@ static int block_til_ready(struct tty_struct *tty, struct file * filp,
 {
 	DECLARE_WAITQUEUE(wait, current);
 	int		retval;
-	int		do_clocal = 0, extra_count = 0;
+	bool		do_clocal = false;
+	bool		extra_count = false;
 	unsigned long	flags;
+	int		dcd;
+	struct tty_port *port = &info->port;
 	
 	if (debug_level >= DEBUG_LEVEL_INFO)
 		printk("%s(%d):block_til_ready on %s\n",
-			 __FILE__,__LINE__, (cpat_pdriver(tty))->name );
+			 __FILE__,__LINE__, tty->driver->name );
 
 	if (filp->f_flags & O_NONBLOCK || tty->flags & (1 << TTY_IO_ERROR)){
 		/* nonblock mode is set or port is not enabled */
-		info->flags |= ASYNC_NORMAL_ACTIVE;
+		port->flags |= ASYNC_NORMAL_ACTIVE;
 		return 0;
 	}
 
-	if (C_CLOCAL(tty))
-		do_clocal = 1;
+	if (tty->termios.c_cflag & CLOCAL)
+		do_clocal = true;
 
 	/* Wait for carrier detect and the line to become
 	 * free (i.e., not in use by the callout).  While we are in
-	 * this loop, info->count is dropped by one, so that
+	 * this loop, port->count is dropped by one, so that
 	 * r56_close() knows when to free things.  We restore it upon
 	 * exit, either normal or abnormal.
 	 */
 	 
 	retval = 0;
-	add_wait_queue(&info->open_wait, &wait);
+	add_wait_queue(&port->open_wait, &wait);
 	
 	if (debug_level >= DEBUG_LEVEL_INFO)
 		printk("%s(%d):block_til_ready before block on %s count=%d\n",
-			 __FILE__, __LINE__, (cpat_pdriver(tty))->name,
-			 info->count );
+			 __FILE__,__LINE__, tty->driver->name, port->count );
 
 	spin_lock_irqsave(&info->irq_spinlock, flags);
 	if (!tty_hung_up_p(filp)) {
-		extra_count = 1;
-		info->count--;
+		extra_count = true;
+		port->count--;
 	}
 	spin_unlock_irqrestore(&info->irq_spinlock, flags);
-	info->blocked_open++;
+	port->blocked_open++;
 	
 	while (1) {
-		if ( (info->params.mode == R56_MODE_ASYNC) && 
-					C_BAUD(tty) )
-		{
-			spin_lock_irqsave(&info->irq_spinlock,flags);
-			info->serial_signals |= SerialSignal_RTS + SerialSignal_DTR;
-		 	usc_set_serial_signals(info);
-			spin_unlock_irqrestore(&info->irq_spinlock,flags);
-		}
+		if (tty->termios.c_cflag & CBAUD)
+			tty_port_raise_dtr_rts(port);
 		
 		set_current_state(TASK_INTERRUPTIBLE);
 		
-		if (tty_hung_up_p(filp) || !(info->flags & ASYNC_INITIALIZED)){
-			retval = (info->flags & ASYNC_HUP_NOTIFY) ?
+		if (tty_hung_up_p(filp) || !(port->flags & ASYNC_INITIALIZED)){
+			retval = (port->flags & ASYNC_HUP_NOTIFY) ?
 					-EAGAIN : -ERESTARTSYS;
 			break;
 		}
 		
-		spin_lock_irqsave(&info->irq_spinlock,flags);
-	 	usc_get_serial_signals(info);
-		spin_unlock_irqrestore(&info->irq_spinlock,flags);
+		dcd = tty_port_carrier_raised(&info->port);
 		
- 		if (!(info->flags & ASYNC_CLOSING) &&
- 		    (do_clocal || (info->serial_signals & SerialSignal_DCD)) ) {
+ 		if (!(port->flags & ASYNC_CLOSING) && (do_clocal || dcd))
  			break;
-		}
 			
 		if (signal_pending(current)) {
 			retval = -ERESTARTSYS;
@@ -3407,31 +3323,55 @@ static int block_til_ready(struct tty_struct *tty, struct file * filp,
 		}
 		
 		if (debug_level >= DEBUG_LEVEL_INFO)
-			printk("%s(%d):block_til_ready on %s count=%d\n",
-				 __FILE__, __LINE__, (cpat_pdriver(tty))->name,
-				 info->count );
+			printk("%s(%d):block_til_ready blocking on %s count=%d\n",
+				 __FILE__,__LINE__, tty->driver->name, port->count );
 				 
+		tty_unlock(tty);
 		schedule();
+		tty_lock(tty);
 	}
 	
 	set_current_state(TASK_RUNNING);
-	remove_wait_queue(&info->open_wait, &wait);
+	remove_wait_queue(&port->open_wait, &wait);
 	
+	/* FIXME: Racy on hangup during close wait */
 	if (extra_count)
-		info->count++;
-	info->blocked_open--;
+		port->count++;
+	port->blocked_open--;
 	
 	if (debug_level >= DEBUG_LEVEL_INFO)
 		printk("%s(%d):block_til_ready after blocking on %s count=%d\n",
-			 __FILE__,__LINE__, (cpat_pdriver(tty))->name, 
-			 info->count );
+			 __FILE__,__LINE__, tty->driver->name, port->count );
 			 
 	if (!retval)
-		info->flags |= ASYNC_NORMAL_ACTIVE;
+		port->flags |= ASYNC_NORMAL_ACTIVE;
 		
 	return retval;
 	
 }	/* end of block_til_ready() */
+
+static int r56_install(struct tty_driver *driver, struct tty_struct *tty)
+{
+	struct r56_struct *info;
+	int line = tty->index;
+
+	/* verify range of specified line number */
+	if (line >= r56_device_count) {
+		printk("%s(%d):r56_open with invalid line #%d.\n",
+			__FILE__, __LINE__, line);
+		return -ENODEV;
+	}
+
+	/* find the info structure for the specified line */
+	info = r56_device_list;
+	while (info && info->line != line)
+		info = info->next_device;
+	if (r56_paranoia_check(info, tty->name, "r56_open"))
+		return -ENODEV;
+	tty->driver_data = info;
+
+	return tty_port_install(&info->port, driver, tty);
+}
 
 /* r56_open()
  *
@@ -3445,43 +3385,26 @@ static int block_til_ready(struct tty_struct *tty, struct file * filp,
  */
 static int r56_open(struct tty_struct *tty, struct file * filp)
 {
-	struct r56_struct	*info;
-	int 			retval, line = 0;
+	struct r56_struct	*info = tty->driver_data;
 	unsigned long flags;
+	int retval;
 
-	/* verify range of specified line number */	
-	line = cpat_line(tty);
-	if ((line < 0) || (line >= r56_device_count)) {
-		printk("%s(%d):r56_open with invalid line #%d.\n",
-			__FILE__,__LINE__,line);
-		return -ENODEV;
-	}
-
-	/* find the info structure for the specified line */
-	info = r56_device_list;
-	while(info && info->line != line)
-		info = info->next_device;
-	if (r56_paranoia_check(info, cpat_name(tty), "r56_open"))
-		return -ENODEV;
-	
-	tty->driver_data = info;
-	info->tty = tty;
+	info->port.tty = tty;
 		
 	if (debug_level >= DEBUG_LEVEL_INFO)
 		printk("%s(%d):r56_open(%s), old ref count = %d\n",
-			 __FILE__,__LINE__,(cpat_pdriver(tty))->name,
-			 info->count);
+			 __FILE__,__LINE__,tty->driver->name, info->port.count);
 
 	/* If port is closing, signal caller to try again */
-	if (tty_hung_up_p(filp) || info->flags & ASYNC_CLOSING){
-		if (info->flags & ASYNC_CLOSING)
-			interruptible_sleep_on(&info->close_wait);
-		retval = ((info->flags & ASYNC_HUP_NOTIFY) ?
+	if (tty_hung_up_p(filp) || info->port.flags & ASYNC_CLOSING){
+		if (info->port.flags & ASYNC_CLOSING)
+			interruptible_sleep_on(&info->port.close_wait);
+		retval = ((info->port.flags & ASYNC_HUP_NOTIFY) ?
 			-EAGAIN : -ERESTARTSYS);
 		goto cleanup;
 	}
 	
-	info->tty->low_latency = (info->flags & ASYNC_LOW_LATENCY) ? 1 : 0;
+	info->port.tty->low_latency = (info->port.flags & ASYNC_LOW_LATENCY) ? 1 : 0;
 
 	spin_lock_irqsave(&info->netlock, flags);
 	if (info->netcount) {
@@ -3489,10 +3412,10 @@ static int r56_open(struct tty_struct *tty, struct file * filp)
 		spin_unlock_irqrestore(&info->netlock, flags);
 		goto cleanup;
 	}
-	info->count++;
+	info->port.count++;
 	spin_unlock_irqrestore(&info->netlock, flags);
 
-	if (info->count == 1) {
+	if (info->port.count == 1) {
 		/* 1st open on this device, init hardware */
 		retval = startup(info);
 		if (retval < 0)
@@ -3515,9 +3438,9 @@ static int r56_open(struct tty_struct *tty, struct file * filp)
 cleanup:			
 	if (retval) {
 		if (tty->count == 1)
-			info->tty = NULL; /* tty layer will release tty struct */
-		if(info->count)
-			info->count--;
+			info->port.tty = NULL; /* tty layer will release tty struct */
+		if(info->port.count)
+			info->port.count--;
 	}
 	
 	return retval;
@@ -3527,27 +3450,23 @@ cleanup:
 /*
  * /proc fs routines....
  */
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 30)
-static inline int line_info(char *buf, struct r56_struct *info)
+
+static inline void line_info(struct seq_file *m, struct r56_struct *info)
 {
 	char	stat_buf[30];
-	int	ret;
 	unsigned long flags;
 
-	// This will setup the io mapping necessary to read from the registers
-	if (info->count < 1) r56_claim_resources(info);
-
 	if (info->bus_type == R56_BUS_TYPE_PCI) {
-		ret = sprintf(buf, "\n%s:PCI io:%04X irq:%d mem:%08X lcr:%08X",
+		seq_printf(m, "%s:PCI io:%04X irq:%d mem:%08X lcr:%08X",
 			info->device_name, info->io_base, info->irq_level,
 			info->phys_memory_base, info->phys_lcr_base);
 	} else {
-		ret = sprintf(buf, "\n%s:(E)ISA io:%04X irq:%d dma:%d",
+		seq_printf(m, "%s:(E)ISA io:%04X irq:%d dma:%d",
 			info->device_name, info->io_base, 
 			info->irq_level, info->dma_level);
 	}
 
-	// output current serial signal states
+	/* output current serial signal states */
 	spin_lock_irqsave(&info->irq_spinlock,flags);
  	usc_get_serial_signals(info);
 	spin_unlock_irqrestore(&info->irq_spinlock,flags);
@@ -3569,130 +3488,6 @@ static inline int line_info(char *buf, struct r56_struct *info)
 
 	if (info->params.mode == R56_MODE_HDLC ||
 	    info->params.mode == R56_MODE_RAW ) {
-		ret += sprintf(buf+ret, " HDLC txok:%d rxok:%d",
-			      info->icount.txok, info->icount.rxok);
-		if (info->icount.txunder)
-			ret += sprintf(buf+ret, " txunder:%d", info->icount.txunder);
-		if (info->icount.txabort)
-			ret += sprintf(buf+ret, " txabort:%d", info->icount.txabort);
-		if (info->icount.rxshort)
-			ret += sprintf(buf+ret, " rxshort:%d", info->icount.rxshort);	
-		if (info->icount.rxlong)
-			ret += sprintf(buf+ret, " rxlong:%d", info->icount.rxlong);
-		if (info->icount.rxover)
-			ret += sprintf(buf+ret, " rxover:%d", info->icount.rxover);
-		if (info->icount.rxcrc)
-			ret += sprintf(buf+ret, " rxcrc:%d", info->icount.rxcrc);
-	} else {
-		ret += sprintf(buf+ret, " ASYNC tx:%d rx:%d",
-			      info->icount.tx, info->icount.rx);
-		if (info->icount.frame)
-			ret += sprintf(buf+ret, " fe:%d", info->icount.frame);
-		if (info->icount.parity)
-			ret += sprintf(buf+ret, " pe:%d", info->icount.parity);
-		if (info->icount.brk)
-			ret += sprintf(buf+ret, " brk:%d", info->icount.brk);	
-		if (info->icount.overrun)
-			ret += sprintf(buf+ret, " oe:%d", info->icount.overrun);
-	}
-	
-	// Append serial signal status to end
-	ret += sprintf(buf+ret, " %s\n", stat_buf+1);
-	
-	ret += sprintf(buf+ret, "txactive=%d bh_req=%d bh_run=%d pending_bh=%x\n",
-	 info->tx_active,info->bh_requested,info->bh_running,
-	 info->pending_bh);
-	 
-	spin_lock_irqsave(&info->irq_spinlock,flags);
-	{	
-	u16 Tcsr = usc_InReg( info, TCSR );
-	u16 Tdmr = usc_InDmaReg( info, TDMR );
-	u16 Ticr = usc_InReg( info, TICR );
-	u16 Rscr = usc_InReg( info, RCSR );
-	u16 Rdmr = usc_InDmaReg( info, RDMR );
-	u16 Ricr = usc_InReg( info, RICR );
-	u16 Icr = usc_InReg( info, ICR );
-	u16 Dccr = usc_InReg( info, DCCR );
-	u16 Tmr = usc_InReg( info, TMR );
-	u16 Tccr = usc_InReg( info, TCCR );
-	u16 Ccar = usc_InReg( info, CCAR );
-	ret += sprintf(buf+ret, "tcsr=%04X tdmr=%04X ticr=%04X rcsr=%04X rdmr=%04X\n"
-                        "ricr=%04X icr =%04X dccr=%04X tmr=%04X tccr=%04X ccar=%04X\n",
-	 		Tcsr,Tdmr,Ticr,Rscr,Rdmr,Ricr,Icr,Dccr,Tmr,Tccr,Ccar );
-	}
-	spin_unlock_irqrestore(&info->irq_spinlock,flags);
-
-	// Now that we're done reading from the device, release it
-	if (info->count < 1) r56_release_resources(info);
-	return ret;
-	
-}	/* end of line_info() */
-
-/* r56_read_proc()
- * 
- * Called to print information about devices
- * 
- * Arguments:
- * 	page	page of memory to hold returned info
- * 	start	
- * 	off
- * 	count
- * 	eof
- * 	data
- * 	
- * Return Value:
- */
-static int r56_read_proc(char *page, char **start, off_t off, int count,
-		 int *eof, void *data)
-{
-	int len = 0, l;
-	off_t	begin = 0;
-	struct r56_struct *info;
-	
-	len += sprintf(page, "%s(rev=%s) debug:%d\n", 
-			driver_name, driver_version, debug_level);
-	
-	info = r56_device_list;
-	while( info ) {
-		l = line_info(page + len, info);
-		len += l;
-		if (len+begin > off+count)
-			goto done;
-		if (len+begin < off) {
-			begin += len;
-			len = 0;
-		}
-		info = info->next_device;
-	}
-
-	*eof = 1;
-done:
-	if (off >= len+begin)
-		return 0;
-	*start = page + (off-begin);
-	return ((count < begin+len-off) ? count : begin+len-off);
-	
-}	/* end of r56_read_proc() */
-#else
-static inline void line_info(struct seq_file *m, struct r56_struct *info)
-{
-	unsigned long flags;
-
-	// This will setup the io mapping necessary to read from the registers
-	if (info->count < 1) r56_claim_resources(info);
-
-	if (info->bus_type == R56_BUS_TYPE_PCI) {
-		seq_printf(m, "\n%s:PCI io:%04X irq:%d mem:%08X lcr:%08X",
-			info->device_name, info->io_base, info->irq_level,
-			info->phys_memory_base, info->phys_lcr_base);
-	} else {
-		seq_printf(m, "\n%s:(E)ISA io:%04X irq:%d dma:%d",
-			info->device_name, info->io_base, 
-			info->irq_level, info->dma_level);
-	}
-
-	if (info->params.mode == R56_MODE_HDLC ||
-	    info->params.mode == R56_MODE_RAW ) {
 		seq_printf(m, " HDLC txok:%d rxok:%d",
 			      info->icount.txok, info->icount.rxok);
 		if (info->icount.txunder)
@@ -3700,7 +3495,7 @@ static inline void line_info(struct seq_file *m, struct r56_struct *info)
 		if (info->icount.txabort)
 			seq_printf(m, " txabort:%d", info->icount.txabort);
 		if (info->icount.rxshort)
-			seq_printf(m, " rxshort:%d", info->icount.rxshort);	
+			seq_printf(m, " rxshort:%d", info->icount.rxshort);
 		if (info->icount.rxlong)
 			seq_printf(m, " rxlong:%d", info->icount.rxlong);
 		if (info->icount.rxover)
@@ -3715,29 +3510,14 @@ static inline void line_info(struct seq_file *m, struct r56_struct *info)
 		if (info->icount.parity)
 			seq_printf(m, " pe:%d", info->icount.parity);
 		if (info->icount.brk)
-			seq_printf(m, " brk:%d", info->icount.brk);	
+			seq_printf(m, " brk:%d", info->icount.brk);
 		if (info->icount.overrun)
 			seq_printf(m, " oe:%d", info->icount.overrun);
 	}
 	
-	// output current serial signal states
-	spin_lock_irqsave(&info->irq_spinlock,flags);
- 	usc_get_serial_signals(info);
-	spin_unlock_irqrestore(&info->irq_spinlock,flags);
+	/* Append serial signal status to end */
+	seq_printf(m, " %s\n", stat_buf+1);
 	
-	if (info->serial_signals & SerialSignal_RTS)
-		seq_printf(m, "|RTS");
-	if (info->serial_signals & SerialSignal_CTS)
-		seq_printf(m, "|CTS");
-	if (info->serial_signals & SerialSignal_DTR)
-		seq_printf(m, "|DTR");
-	if (info->serial_signals & SerialSignal_DSR)
-		seq_printf(m, "|DSR");
-	if (info->serial_signals & SerialSignal_DCD)
-		seq_printf(m, "|CD");
-	if (info->serial_signals & SerialSignal_RI)
-		seq_printf(m, "|RI");
-
 	seq_printf(m, "txactive=%d bh_req=%d bh_run=%d pending_bh=%x\n",
 	 info->tx_active,info->bh_requested,info->bh_running,
 	 info->pending_bh);
@@ -3760,11 +3540,9 @@ static inline void line_info(struct seq_file *m, struct r56_struct *info)
 	 		Tcsr,Tdmr,Ticr,Rscr,Rdmr,Ricr,Icr,Dccr,Tmr,Tccr,Ccar );
 	}
 	spin_unlock_irqrestore(&info->irq_spinlock,flags);
+}
 
-	// Now that we're done reading from the device, release it
-	if (info->count < 1) r56_release_resources(info);
-}	/* end of line_info() */
-
+/* Called to print information about devices */
 static int r56_proc_show(struct seq_file *m, void *v)
 {
 	struct r56_struct *info;
@@ -3792,7 +3570,6 @@ static const struct file_operations r56_proc_fops = {
 	.llseek = seq_lseek,
 	.release = single_release,
 };
-#endif
 
 /* r56_allocate_dma_buffers()
  * 
@@ -3925,9 +3702,7 @@ static int r56_alloc_buffer_list_memory( struct r56_struct *info )
 		/* inspect portions of the buffer while other portions are being */
 		/* updated by the adapter using Bus Master DMA. */
 
-		info->buffer_list = cpat_dma_alloc(BUFFERLISTSIZE, 
-				                   &info->buffer_list_dma_addr,
-						   GFP_KERNEL);
+		info->buffer_list = dma_alloc_coherent(NULL, BUFFERLISTSIZE, &info->buffer_list_dma_addr, GFP_KERNEL);
 		if (info->buffer_list == NULL)
 			return -ENOMEM;
 		info->buffer_list_phys = (u32)(info->buffer_list_dma_addr);
@@ -3998,8 +3773,7 @@ static int r56_alloc_buffer_list_memory( struct r56_struct *info )
 static void r56_free_buffer_list_memory( struct r56_struct *info )
 {
 	if (info->buffer_list && info->bus_type != R56_BUS_TYPE_PCI)
-		cpat_dma_free(BUFFERLISTSIZE, info->buffer_list,
-			      info->buffer_list_dma_addr);
+		dma_free_coherent(NULL, BUFFERLISTSIZE, info->buffer_list, info->buffer_list_dma_addr);
 		
 	info->buffer_list = NULL;
 	info->rx_buffer_list = NULL;
@@ -4038,9 +3812,7 @@ static int r56_alloc_frame_memory(struct r56_struct *info,DMABUFFERENTRY *Buffer
 			info->last_mem_alloc += DMABUFFERSIZE;
 		} else {
 			/* ISA adapter uses system memory. */
-			BufferList[i].virt_addr = cpat_dma_alloc(DMABUFFERSIZE,
-					               &BufferList[i].dma_addr,
-						       GFP_KERNEL);
+			BufferList[i].virt_addr = dma_alloc_coherent(NULL, DMABUFFERSIZE, &BufferList[i].dma_addr, GFP_KERNEL);
 			if (BufferList[i].virt_addr == NULL)
 				return -ENOMEM;
 			phys_addr = (u32)(BufferList[i].dma_addr);
@@ -4074,9 +3846,7 @@ static void r56_free_frame_memory(struct r56_struct *info, DMABUFFERENTRY *Buffe
 		for ( i = 0 ; i < Buffercount ; i++ ) {
 			if ( BufferList[i].virt_addr ) {
 				if ( info->bus_type != R56_BUS_TYPE_PCI )
-					cpat_dma_free(DMABUFFERSIZE, 
-						      BufferList[i].virt_addr,
-						      BufferList[i].dma_addr);
+					dma_free_coherent(NULL, DMABUFFERSIZE, BufferList[i].virt_addr, BufferList[i].dma_addr);
 				BufferList[i].virt_addr = NULL;
 			}
 		}
@@ -4134,9 +3904,7 @@ static int r56_alloc_intermediate_rxbuffer_memory(struct r56_struct *info)
  */
 static void r56_free_intermediate_rxbuffer_memory(struct r56_struct *info)
 {
-	if ( info->intermediate_rxbuffer )
-		kfree(info->intermediate_rxbuffer);
-
+	kfree(info->intermediate_rxbuffer);
 	info->intermediate_rxbuffer = NULL;
 
 }	/* end of r56_free_intermediate_rxbuffer_memory() */
@@ -4167,8 +3935,13 @@ static int r56_alloc_intermediate_txbuffer_memory(struct r56_struct *info)
 	for ( i=0; i<info->num_tx_holding_buffers; ++i) {
 		info->tx_holding_buffers[i].buffer =
 			kmalloc(info->max_frame_size, GFP_KERNEL);
-		if ( info->tx_holding_buffers[i].buffer == NULL )
+		if (info->tx_holding_buffers[i].buffer == NULL) {
+			for (--i; i >= 0; i--) {
+				kfree(info->tx_holding_buffers[i].buffer);
+				info->tx_holding_buffers[i].buffer = NULL;
+			}
 			return -ENOMEM;
+		}
 	}
 
 	return 0;
@@ -4190,10 +3963,8 @@ static void r56_free_intermediate_txbuffer_memory(struct r56_struct *info)
 	int i;
 
 	for ( i=0; i<info->num_tx_holding_buffers; ++i ) {
-		if ( info->tx_holding_buffers[i].buffer ) {
-				kfree(info->tx_holding_buffers[i].buffer);
-				info->tx_holding_buffers[i].buffer=NULL;
-		}
+		kfree(info->tx_holding_buffers[i].buffer);
+		info->tx_holding_buffers[i].buffer = NULL;
 	}
 
 	info->get_tx_holding_index = 0;
@@ -4213,13 +3984,13 @@ static void r56_free_intermediate_txbuffer_memory(struct r56_struct *info)
  *
  *	info		pointer to device instance data
  *
- * Return Value:	1 if next buffered tx request loaded
+ * Return Value:	true if next buffered tx request loaded
  * 			into adapter's tx dma buffer,
- * 			0 otherwise
+ * 			false otherwise
  */
-static int load_next_tx_holding_buffer(struct r56_struct *info)
+static bool load_next_tx_holding_buffer(struct r56_struct *info)
 {
-	int ret = 0;
+	bool ret = false;
 
 	if ( info->tx_holding_count ) {
 		/* determine if we have enough tx dma buffers
@@ -4243,7 +4014,7 @@ static int load_next_tx_holding_buffer(struct r56_struct *info)
 			/* restart transmit timer */
 			mod_timer(&info->tx_timer, jiffies + msecs_to_jiffies(5000));
 
-			ret = 1;
+			ret = true;
 		}
 	}
 
@@ -4289,20 +4060,20 @@ static int r56_claim_resources(struct r56_struct *info)
 			__FILE__,__LINE__,info->device_name, info->io_base);
 		return -ENODEV;
 	}
-	info->io_addr_requested = 1;
+	info->io_addr_requested = true;
 	
 	if ( request_irq(info->irq_level,r56_interrupt,info->irq_flags,
 		info->device_name, info ) < 0 ) {
-		printk( "%s(%d):Cant request interrupt on device %s IRQ=%d\n",
+		printk( "%s(%d):Can't request interrupt on device %s IRQ=%d\n",
 			__FILE__,__LINE__,info->device_name, info->irq_level );
 		goto errout;
 	}
-	info->irq_requested = 1;
+	info->irq_requested = true;
 	
 	if ( info->bus_type == R56_BUS_TYPE_PCI ) {
 			if(!(info->lcr_base = ioremap(info->phys_lcr_base,256)))
 			{
-				printk ("%s(%d):Cant map shared memory on device %s MemAddr=%08X\n",
+				printk ("%s(%d):Can't map shared memory on device %s MemAddr=%08X\n",
 				 			__FILE__, __LINE__, info->device_name,
 				 			info->phys_lcr_base);
 				goto errout;
@@ -4312,7 +4083,7 @@ static int r56_claim_resources(struct r56_struct *info)
 
 		info->memory_base = ioremap(info->phys_memory_base,SHARED_MEM_ADDRESS_SIZE);
 		if (!info->memory_base) {
-			printk( "%s(%d):Cant map shared memory on device %s MemAddr=%08X\n",
+			printk( "%s(%d):Can't map shared memory on device %s MemAddr=%08X\n",
 				__FILE__,__LINE__,info->device_name, info->phys_memory_base );
 			goto errout;
 		}
@@ -4325,7 +4096,7 @@ static int r56_claim_resources(struct r56_struct *info)
 		
 		info->lcr_base = ioremap(info->phys_lcr_base,PAGE_SIZE) + info->lcr_offset;
 		if (!info->lcr_base) {
-			printk( "%s(%d):Cant map LCR memory on device %s MemAddr=%08X\n",
+			printk( "%s(%d):Can't map LCR memory on device %s MemAddr=%08X\n",
 				__FILE__,__LINE__,info->device_name, info->phys_lcr_base );
 			goto errout;
 		}
@@ -4334,12 +4105,12 @@ static int r56_claim_resources(struct r56_struct *info)
 		/* claim DMA channel */
 		
 		if (request_dma(info->dma_level,info->device_name) < 0){
-			printk( "%s(%d):Cant request DMA channel on device %s DMA=%d\n",
+			printk( "%s(%d):Can't request DMA channel on device %s DMA=%d\n",
 				__FILE__,__LINE__,info->device_name, info->dma_level );
 			r56_release_resources( info );
 			return -ENODEV;
 		}
-		info->dma_requested = 1;
+		info->dma_requested = true;
 
 		/* ISA adapter uses bus master DMA */		
 		set_dma_mode(info->dma_level,DMA_MODE_CASCADE);
@@ -4347,12 +4118,11 @@ static int r56_claim_resources(struct r56_struct *info)
 	}
 	
 	if ( r56_allocate_dma_buffers(info) < 0 ) {
-		printk( "%s(%d):Cant allocate DMA buffers on device %s DMA=%d\n",
+		printk( "%s(%d):Can't allocate DMA buffers on device %s DMA=%d\n",
 			__FILE__,__LINE__,info->device_name, info->dma_level );
 		goto errout;
 	}	
 	
-	info->all_resources_claimed = 1;
 	return 0;
 errout:
 	r56_release_resources(info);
@@ -4365,17 +4135,15 @@ static void r56_release_resources(struct r56_struct *info)
 	if ( debug_level >= DEBUG_LEVEL_INFO )
 		printk( "%s(%d):r56_release_resources(%s) entry\n",
 			__FILE__,__LINE__,info->device_name );
-	
-	info->all_resources_claimed = 0;
-
+			
 	if ( info->irq_requested ) {
 		free_irq(info->irq_level, info);
-		info->irq_requested = 0;
+		info->irq_requested = false;
 	}
 	if ( info->dma_requested ) {
 		disable_dma(info->dma_level);
 		free_dma(info->dma_level);
-		info->dma_requested = 0;
+		info->dma_requested = false;
 	}
 	r56_free_dma_buffers(info);
 	r56_free_intermediate_rxbuffer_memory(info);
@@ -4383,16 +4151,16 @@ static void r56_release_resources(struct r56_struct *info)
 	
 	if ( info->io_addr_requested ) {
 		release_region(info->io_base,info->io_addr_size);
-		info->io_addr_requested = 0;
+		info->io_addr_requested = false;
 	}
 #if 0
 	if ( info->shared_mem_requested ) {
 		release_mem_region(info->phys_memory_base,0x40000);
-		info->shared_mem_requested = 0;
+		info->shared_mem_requested = false;
 	}
 	if ( info->lcr_mem_requested ) {
 		release_mem_region(info->phys_lcr_base + info->lcr_offset,128);
-		info->lcr_mem_requested = 0;
+		info->lcr_mem_requested = false;
 	}
 #endif
 	if (info->memory_base){
@@ -4470,7 +4238,16 @@ static void r56_add_device( struct r56_struct *info )
 		     	info->max_frame_size );
 	}
 
+#if R56_GENERIC_HDLC
+	hdlcdev_init(info);
+#endif
+
 }	/* end of r56_add_device() */
+
+static const struct tty_port_operations r56_port_ops = {
+	.carrier_raised = carrier_raised,
+	.dtr_rts = dtr_rts,
+};
 
 /* r56_allocate_device()
  * 
@@ -4483,20 +4260,19 @@ static struct r56_struct* r56_allocate_device(void)
 {
 	struct r56_struct *info;
 	
-	info = (struct r56_struct *)kmalloc(sizeof(struct r56_struct),
+	info = (struct r56_struct *)kzalloc(sizeof(struct r56_struct),
 		 GFP_KERNEL);
 		 
 	if (!info) {
 		printk("Error can't allocate device instance data\n");
 	} else {
-		memset(info, 0, sizeof(struct r56_struct));
+		tty_port_init(&info->port);
+		info->port.ops = &r56_port_ops;
 		info->magic = R56_MAGIC;
-		CPAT_INIT_WORK(&info->task, r56_bh_handler, info);
+		INIT_WORK(&info->task, r56_bh_handler);
 		info->max_frame_size = 4096;
-		info->close_delay = 5*HZ/10;
-		info->closing_wait = 30*HZ;
-		init_waitqueue_head(&info->open_wait);
-		init_waitqueue_head(&info->close_wait);
+		info->port.close_delay = 5*HZ/10;
+		info->port.closing_wait = 30*HZ;
 		init_waitqueue_head(&info->status_event_wait_q);
 		init_waitqueue_head(&info->event_wait_q);
 		spin_lock_init(&info->irq_spinlock);
@@ -4512,6 +4288,7 @@ static struct r56_struct* r56_allocate_device(void)
 }	/* end of r56_allocate_device()*/
 
 static struct tty_operations r56_ops = {
+	.install = r56_install,
 	.open = r56_open,
 	.close = r56_close,
 	.write = r56_write,
@@ -4526,17 +4303,14 @@ static struct tty_operations r56_ops = {
 	.send_xchar = r56_send_xchar,
 	.break_ctl = r56_break,
 	.wait_until_sent = r56_wait_until_sent,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 30)
- 	.read_proc = r56_read_proc,
-#else
-	.proc_fops = &r56_proc_fops,
-#endif
 	.set_termios = r56_set_termios,
 	.stop = r56_stop,
 	.start = r56_start,
 	.hangup = r56_hangup,
 	.tiocmget = tiocmget,
 	.tiocmset = tiocmset,
+	.get_icount = r56_get_icount,
+	.proc_fops = &r56_proc_fops,
 };
 
 /*
@@ -4549,9 +4323,7 @@ static int r56_init_tty(void)
 	serial_driver = alloc_tty_driver(r56_device_count);
 	if (!serial_driver)
 		return -ENOMEM;
-
-	// Look in cpat_setup_serial
-	//serial_driver->owner = THIS_MODULE;
+	
 	serial_driver->driver_name = "route56";
 	serial_driver->name = "ttySL";
 	serial_driver->major = ttymajor;
@@ -4561,11 +4333,10 @@ static int r56_init_tty(void)
 	serial_driver->init_termios = tty_std_termios;
 	serial_driver->init_termios.c_cflag =
 		B9600 | CS8 | CREAD | HUPCL | CLOCAL;
+	serial_driver->init_termios.c_ispeed = 9600;
+	serial_driver->init_termios.c_ospeed = 9600;
 	serial_driver->flags = TTY_DRIVER_REAL_RAW;
-
 	tty_set_operations(serial_driver, &r56_ops);
-	cpat_setup_serial(serial_driver);
-	
 	if ((rc = tty_register_driver(serial_driver)) < 0) {
 		printk("%s(%d):Couldn't register serial driver\n",
 			__FILE__,__LINE__);
@@ -4627,15 +4398,18 @@ static void route56_cleanup(void)
 		if ((rc = tty_unregister_driver(serial_driver)))
 			printk("%s(%d) failed to unregister tty driver err=%d\n",
 			       __FILE__,__LINE__,rc);
-
 		put_tty_driver(serial_driver);
 	}
 
 	info = r56_device_list;
 	while(info) {
+#if R56_GENERIC_HDLC
+		hdlcdev_exit(info);
+#endif
 		r56_release_resources(info);
 		tmp = info;
 		info = info->next_device;
+		tty_port_destroy(&tmp->port);
 		kfree(tmp);
 	}
 	
@@ -4652,13 +4426,13 @@ static int __init route56_init(void)
   		BREAKPOINT();
 	}
 
- 	printk("Loading %s(rev=%s)\n", driver_name, driver_version);
+ 	printk("%s(rev=%s)\n", driver_name, driver_version);
 
 	r56_enum_isa_devices();
 	if ((rc = pci_register_driver(&route56_pci_driver)) < 0)
 		printk("%s:failed to register PCI driver, error=%d\n",__FILE__,rc);
 	else
-		pci_registered = 1;
+		pci_registered = true;
 
 	if ((rc = r56_init_tty()) < 0)
 		goto error;
@@ -4893,7 +4667,7 @@ static void usc_set_interface(struct r56_struct *info)
 static void usc_set_sdlc_mode( struct r56_struct *info )
 {
 	u16 RegValue;
-	int PreSL1660;
+	bool PreSL1660;
 	
 	/*
 	 * determine if the IUSC on the adapter is pre-SL1660. If
@@ -4906,11 +4680,7 @@ static void usc_set_sdlc_mode( struct r56_struct *info )
 	 */
 	usc_OutReg(info,TMCR,0x1f);
 	RegValue=usc_InReg(info,TMDR);
-	if ( RegValue == IUSC_PRE_SL1660 )
-		PreSL1660 = 1;
-	else
-		PreSL1660 = 0;
-	
+	PreSL1660 = (RegValue == IUSC_PRE_SL1660);
 
  	if ( info->params.flags & HDLC_FLAG_HDLC_LOOPMODE )
  	{
@@ -5610,9 +5380,9 @@ static void usc_process_rxoverrun_sync( struct r56_struct *info )
 	int start_index;
 	int end_index;
 	int frame_start_index;
-	int start_of_frame_found = FALSE;
-	int end_of_frame_found = FALSE;
-	int reprogram_dma = FALSE;
+	bool start_of_frame_found = false;
+	bool end_of_frame_found = false;
+	bool reprogram_dma = false;
 
 	DMABUFFERENTRY *buffer_list = info->rx_buffer_list;
 	u32 phys_addr;
@@ -5638,9 +5408,9 @@ static void usc_process_rxoverrun_sync( struct r56_struct *info )
 
 		if ( !start_of_frame_found )
 		{
-			start_of_frame_found = TRUE;
+			start_of_frame_found = true;
 			frame_start_index = end_index;
-			end_of_frame_found = FALSE;
+			end_of_frame_found = false;
 		}
 
 		if ( buffer_list[end_index].status )
@@ -5651,8 +5421,8 @@ static void usc_process_rxoverrun_sync( struct r56_struct *info )
 			/* We want to leave the buffers for this frame intact. */
 			/* Move on to next possible frame. */
 
-			start_of_frame_found = FALSE;
-			end_of_frame_found = TRUE;
+			start_of_frame_found = false;
+			end_of_frame_found = true;
 		}
 
   		/* advance to next buffer entry in linked list */
@@ -5667,8 +5437,8 @@ static void usc_process_rxoverrun_sync( struct r56_struct *info )
 			/* completely screwed, reset all receive buffers! */
 			r56_reset_rx_dma_buffers( info );
 			frame_start_index = 0;
-			start_of_frame_found = FALSE;
-			reprogram_dma = TRUE;
+			start_of_frame_found = false;
+			reprogram_dma = true;
 			break;
 		}
 	}
@@ -5694,7 +5464,7 @@ static void usc_process_rxoverrun_sync( struct r56_struct *info )
 
 		} while( start_index != end_index );
 
-		reprogram_dma = TRUE;
+		reprogram_dma = true;
 	}
 
 	if ( reprogram_dma )
@@ -5764,9 +5534,9 @@ static void usc_stop_receiver( struct r56_struct *info )
 	usc_OutReg( info, CCSR, (u16)(usc_InReg(info,CCSR) | BIT13) );
 	usc_RTCmd( info, RTCmd_PurgeRxFifo );
 
-	info->rx_enabled = 0;
-	info->rx_overflow = 0;
-	info->rx_rcc_underrun = 0;
+	info->rx_enabled = false;
+	info->rx_overflow = false;
+	info->rx_rcc_underrun = false;
 	
 }	/* end of stop_receiver() */
 
@@ -5829,7 +5599,7 @@ static void usc_start_receiver( struct r56_struct *info )
 
 	usc_OutReg( info, CCSR, 0x1020 );
 
-	info->rx_enabled = 1;
+	info->rx_enabled = true;
 
 }	/* end of usc_start_receiver() */
 
@@ -5857,14 +5627,14 @@ static void usc_start_transmitter( struct r56_struct *info )
 		/* RTS and set a flag indicating that the driver should */
 		/* negate RTS when the transmission completes. */
 
-		info->drop_rts_on_tx_done = 0;
+		info->drop_rts_on_tx_done = false;
 
 		if ( info->params.flags & HDLC_FLAG_AUTO_RTS ) {
 			usc_get_serial_signals( info );
 			if ( !(info->serial_signals & SerialSignal_RTS) ) {
 				info->serial_signals |= SerialSignal_RTS;
 				usc_set_serial_signals( info );
-				info->drop_rts_on_tx_done = 1;
+				info->drop_rts_on_tx_done = true;
 			}
 		}
 
@@ -5934,14 +5704,14 @@ static void usc_start_transmitter( struct r56_struct *info )
 			
 			usc_TCmd( info, TCmd_SendFrame );
 			
-			info->tx_timer.expires = jiffies + msecs_to_jiffies(5000);
-			add_timer(&info->tx_timer);	
+			mod_timer(&info->tx_timer, jiffies +
+					msecs_to_jiffies(5000));
 		}
-		info->tx_active = 1;
+		info->tx_active = true;
 	}
 
 	if ( !info->tx_enabled ) {
-		info->tx_enabled = 1;
+		info->tx_enabled = true;
 		if ( info->params.flags & HDLC_FLAG_AUTO_CTS )
 			usc_EnableTransmitter(info,ENABLE_AUTO_CTS);
 		else
@@ -5973,8 +5743,8 @@ static void usc_stop_transmitter( struct r56_struct *info )
 	usc_DmaCmd( info, DmaCmd_ResetTxChannel );
 	usc_RTCmd( info, RTCmd_PurgeTxFifo );
 
-	info->tx_enabled = 0;
-	info->tx_active  = 0;
+	info->tx_enabled = false;
+	info->tx_active = false;
 
 }	/* end of usc_stop_transmitter() */
 
@@ -6494,13 +6264,14 @@ static void usc_set_txidle( struct r56_struct *info )
  */
 static void usc_get_serial_signals( struct r56_struct *info )
 {
-	u16 status = 0;
+	u16 status;
 
 	/* clear all serial signals except DTR and RTS */
 	info->serial_signals &= SerialSignal_DTR + SerialSignal_RTS;
 
 	/* Read the Misc Interrupt status Register (MISR) to get */
 	/* the V24 status signals. */
+
 	status = usc_InReg( info, MISR );
 
 	/* set serial signal bits to reflect MISR */
@@ -6532,7 +6303,8 @@ static void usc_set_serial_signals( struct r56_struct *info )
 	u16 Control;
 	unsigned char V24Out = info->serial_signals;
 
-	// Get the current value of the Port Control Register (PCR)
+	/* get the current value of the Port Control Register (PCR) */
+
 	Control = usc_InReg( info, PCR );
 
 	// If we must SET RTS -- Port 7 must go low 0b10XX XXXX XXXX XXXX
@@ -6746,7 +6518,7 @@ static void r56_reset_rx_dma_buffers( struct r56_struct *info )
  */
 static void r56_free_rx_frame_buffers( struct r56_struct *info, unsigned int StartIndex, unsigned int EndIndex )
 {
-	int Done = 0;
+	bool Done = false;
 	DMABUFFERENTRY *pBufEntry;
 	unsigned int Index;
 
@@ -6760,7 +6532,7 @@ static void r56_free_rx_frame_buffers( struct r56_struct *info, unsigned int Sta
 
 		if ( Index == EndIndex ) {
 			/* This is the last buffer of the frame! */
-			Done = 1;
+			Done = true;
 		}
 
 		/* reset current buffer for reuse */
@@ -6787,16 +6559,16 @@ static void r56_free_rx_frame_buffers( struct r56_struct *info, unsigned int Sta
  * Arguments:	 	info	pointer to device extension
  * Return Value:	1 if frame returned, otherwise 0
  */
-static int r56_get_rx_frame(struct r56_struct *info)
+static bool r56_get_rx_frame(struct r56_struct *info)
 {
 	unsigned int StartIndex, EndIndex;	/* index of 1st and last buffers of Rx frame */
 	unsigned short status;
 	DMABUFFERENTRY *pBufEntry;
 	unsigned int framesize = 0;
-	int ReturnCode = 0;
+	bool ReturnCode = false;
 	unsigned long flags;
-	struct tty_struct *tty = info->tty;
-	int return_frame = 0;
+	struct tty_struct *tty = info->port.tty;
+	bool return_frame = false;
 	
 	/*
 	 * current_rx_buffer points to the 1st buffer of the next available
@@ -6855,11 +6627,17 @@ static int r56_get_rx_frame(struct r56_struct *info)
 		else {
 			info->icount.rxcrc++;
 			if ( info->params.crc_type & HDLC_CRC_RETURN_EX )
-				return_frame = 1;
+				return_frame = true;
 		}
 		framesize = 0;
+#if R56_GENERIC_HDLC
+		{
+			info->netdev->stats.rx_errors++;
+			info->netdev->stats.rx_frame_errors++;
+		}
+#endif
 	} else
-		return_frame = 1;
+		return_frame = true;
 
 	if ( return_frame ) {
 		/* receive frame has no errors, get frame size.
@@ -6927,16 +6705,18 @@ static int r56_get_rx_frame(struct r56_struct *info)
 						*ptmp);
 			}
 
-			cpat_ldisc_receive_buf(tty, 
-					       info->intermediate_rxbuffer, 
-					       info->flag_buf, 
-					       framesize);
+#if R56_GENERIC_HDLC
+			if (info->netcount)
+				hdlcdev_rx(info,info->intermediate_rxbuffer,framesize);
+			else
+#endif
+				ldisc_receive_buf(tty, info->intermediate_rxbuffer, info->flag_buf, framesize);
 		}
 	}
 	/* Free the buffers used by this frame. */
 	r56_free_rx_frame_buffers( info, StartIndex, EndIndex );
 
-	ReturnCode = 1;
+	ReturnCode = true;
 
 Cleanup:
 
@@ -6977,15 +6757,15 @@ Cleanup:
  * Arguments:	 	info	pointer to device extension
  * Return Value:	1 if frame returned, otherwise 0
  */
-static int r56_get_raw_rx_frame(struct r56_struct *info)
+static bool r56_get_raw_rx_frame(struct r56_struct *info)
 {
 	unsigned int CurrentIndex, NextIndex;
 	unsigned short status;
 	DMABUFFERENTRY *pBufEntry;
 	unsigned int framesize = 0;
-	int ReturnCode = 0;
+	bool ReturnCode = false;
 	unsigned long flags;
-	struct tty_struct *tty = info->tty;
+	struct tty_struct *tty = info->port.tty;
 
 	/*
  	 * current_rx_buffer points to the 1st buffer of the next available
@@ -7102,13 +6882,13 @@ static int r56_get_raw_rx_frame(struct r56_struct *info)
 			memcpy( info->intermediate_rxbuffer, pBufEntry->virt_addr, framesize);
 			info->icount.rxok++;
 
-			cpat_ldisc_receive_buf(tty, info->intermediate_rxbuffer, info->flag_buf, framesize);
+			ldisc_receive_buf(tty, info->intermediate_rxbuffer, info->flag_buf, framesize);
 		}
 
 		/* Free the buffers used by this frame. */
 		r56_free_rx_frame_buffers( info, CurrentIndex, CurrentIndex );
 
-		ReturnCode = 1;
+		ReturnCode = true;
 	}
 
 
@@ -7217,15 +6997,15 @@ static void r56_load_tx_dma_buffer(struct r56_struct *info,
  * 	Performs a register test of the 16C32.
  * 	
  * Arguments:		info	pointer to device instance data
- * Return Value:		TRUE if test passed, otherwise FALSE
+ * Return Value:		true if test passed, otherwise false
  */
-static BOOLEAN r56_register_test( struct r56_struct *info )
+static bool r56_register_test( struct r56_struct *info )
 {
 	static unsigned short BitPatterns[] =
 		{ 0x0000, 0xffff, 0xaaaa, 0x5555, 0x1234, 0x6969, 0x9696, 0x0f0f };
 	static unsigned int Patterncount = sizeof(BitPatterns)/sizeof(unsigned short);
 	unsigned int i;
-	BOOLEAN rc = TRUE;
+	bool rc = true;
 	unsigned long flags;
 
 	spin_lock_irqsave(&info->irq_spinlock,flags);
@@ -7236,10 +7016,10 @@ static BOOLEAN r56_register_test( struct r56_struct *info )
 	if ( (usc_InReg( info, SICR ) != 0) ||
 		  (usc_InReg( info, IVR  ) != 0) ||
 		  (usc_InDmaReg( info, DIVR ) != 0) ){
-		rc = FALSE;
+		rc = false;
 	}
 
-	if ( rc == TRUE ){
+	if ( rc ){
 		/* Write bit patterns to various registers but do it out of */
 		/* sync, then read back and verify values. */
 
@@ -7257,7 +7037,7 @@ static BOOLEAN r56_register_test( struct r56_struct *info )
 				  (usc_InReg( info, RCLR ) != BitPatterns[(i+3)%Patterncount]) ||
 				  (usc_InReg( info, RSR )  != BitPatterns[(i+4)%Patterncount]) ||
 				  (usc_InDmaReg( info, TBCR ) != BitPatterns[(i+5)%Patterncount]) ){
-				rc = FALSE;
+				rc = false;
 				break;
 			}
 		}
@@ -7273,26 +7053,26 @@ static BOOLEAN r56_register_test( struct r56_struct *info )
 /* r56_irq_test() 	Perform interrupt test of the 16C32.
  * 
  * Arguments:		info	pointer to device instance data
- * Return Value:	TRUE if test passed, otherwise FALSE
+ * Return Value:	true if test passed, otherwise false
  */
-static BOOLEAN r56_irq_test( struct r56_struct *info )
+static bool r56_irq_test( struct r56_struct *info )
 {
 	unsigned long EndTime;
 	unsigned long flags;
 
 	// For now skip the irq test on the 5105
 	if (info->hw_version == R565_DEVICE_ID)
-		return TRUE;
+		return true;
 
 	spin_lock_irqsave(&info->irq_spinlock,flags);
 	usc_reset(info);
 
 	/*
 	 * Setup 16C32 to interrupt on TxC pin (14MHz clock) transition. 
-	 * The ISR sets irq_occurred to 1. 
+	 * The ISR sets irq_occurred to true.
 	 */
 
-	info->irq_occurred = FALSE;
+	info->irq_occurred = false;
 
 	/* Enable INTEN gate for ISA adapter (Port 6, Bit12) */
 	/* Enable INTEN (Port 6, Bit12) */
@@ -7328,10 +7108,7 @@ static BOOLEAN r56_irq_test( struct r56_struct *info )
 	usc_reset(info);
 	spin_unlock_irqrestore(&info->irq_spinlock,flags);
 	
-	if ( !info->irq_occurred ) 
-		return FALSE;
-	else
-		return TRUE;
+	return info->irq_occurred;
 
 }	/* end of r56_irq_test() */
 
@@ -7342,16 +7119,16 @@ static BOOLEAN r56_irq_test( struct r56_struct *info )
  * 	using single buffer DMA mode.
  * 	
  * Arguments:		info	pointer to device instance data
- * Return Value:	TRUE if test passed, otherwise FALSE
+ * Return Value:	true if test passed, otherwise false
  */
-static BOOLEAN r56_dma_test( struct r56_struct *info )
+static bool r56_dma_test( struct r56_struct *info )
 {
 	unsigned short FifoLevel;
 	unsigned long phys_addr;
 	unsigned int FrameSize;
 	unsigned int i;
 	char *TmpPtr;
-	BOOLEAN rc = TRUE;
+	bool rc = true;
 	unsigned short status=0;
 	unsigned long EndTime;
 	unsigned long flags;
@@ -7464,7 +7241,7 @@ static BOOLEAN r56_dma_test( struct r56_struct *info )
 
 	for(;;) {
 		if (time_after(jiffies, EndTime)) {
-			rc = FALSE;
+			rc = false;
 			break;
 		}
 
@@ -7520,7 +7297,7 @@ static BOOLEAN r56_dma_test( struct r56_struct *info )
 
 	for(;;) {
 		if (time_after(jiffies, EndTime)) {
-			rc = FALSE;
+			rc = false;
 			break;
 		}
 
@@ -7540,7 +7317,7 @@ static BOOLEAN r56_dma_test( struct r56_struct *info )
 	}
 
 
-	if ( rc == TRUE )
+	if ( rc )
 	{
 		/* Enable 16C32 transmitter. */
 
@@ -7568,7 +7345,7 @@ static BOOLEAN r56_dma_test( struct r56_struct *info )
 
 		while ( !(status & (BIT6+BIT5+BIT4+BIT2+BIT1)) ) {
 			if (time_after(jiffies, EndTime)) {
-				rc = FALSE;
+				rc = false;
 				break;
 			}
 
@@ -7579,13 +7356,13 @@ static BOOLEAN r56_dma_test( struct r56_struct *info )
 	}
 
 
-	if ( rc == TRUE ){
+	if ( rc ){
 		/* CHECK FOR TRANSMIT ERRORS */
 		if ( status & (BIT5 + BIT1) ) 
-			rc = FALSE;
+			rc = false;
 	}
 
-	if ( rc == TRUE ) {
+	if ( rc ) {
 		/* WAIT FOR RECEIVE COMPLETE */
 
 		/* Wait 100ms */
@@ -7595,7 +7372,7 @@ static BOOLEAN r56_dma_test( struct r56_struct *info )
 		status=info->rx_buffer_list[0].status;
 		while ( status == 0 ) {
 			if (time_after(jiffies, EndTime)) {
-				rc = FALSE;
+				rc = false;
 				break;
 			}
 			status=info->rx_buffer_list[0].status;
@@ -7603,17 +7380,17 @@ static BOOLEAN r56_dma_test( struct r56_struct *info )
 	}
 
 
-	if ( rc == TRUE ) {
+	if ( rc ) {
 		/* CHECK FOR RECEIVE ERRORS */
 		status = info->rx_buffer_list[0].status;
 
 		if ( status & (BIT8 + BIT3 + BIT1) ) {
 			/* receive error has occurred */
-			rc = FALSE;
+			rc = false;
 		} else {
 			if ( memcmp( info->tx_buffer_list[0].virt_addr ,
 				info->rx_buffer_list[0].virt_addr, FrameSize ) ){
-				rc = FALSE;
+				rc = false;
 			}
 		}
 	}
@@ -7676,13 +7453,13 @@ static int r56_adapter_test( struct r56_struct *info )
  * 	Test the shared memory on a PCI adapter.
  * 
  * Arguments:		info	pointer to device instance data
- * Return Value:	TRUE if test passed, otherwise FALSE
+ * Return Value:	true if test passed, otherwise false
  */
-static BOOLEAN r56_memory_test( struct r56_struct *info )
+static bool r56_memory_test( struct r56_struct *info )
 {
-	static unsigned long BitPatterns[] = { 0x0, 0x55555555, 0xaaaaaaaa,
-											0x66666666, 0x99999999, 0xffffffff, 0x12345678 };
-	unsigned long Patterncount = sizeof(BitPatterns)/sizeof(unsigned long);
+	static unsigned long BitPatterns[] =
+		{ 0x0, 0x55555555, 0xaaaaaaaa, 0x66666666, 0x99999999, 0xffffffff, 0x12345678 };
+	unsigned long Patterncount = ARRAY_SIZE(BitPatterns);
 	unsigned long i;
 	unsigned long TestLimit = SHARED_MEM_ADDRESS_SIZE/sizeof(unsigned long);
 	unsigned char *TestAddr;
@@ -7690,7 +7467,7 @@ static BOOLEAN r56_memory_test( struct r56_struct *info )
 	int need_to_output=0;
 
 	if ( info->bus_type != R56_BUS_TYPE_PCI )
-		return TRUE;
+		return true;
 
 	TestAddr = info->memory_base;
 	/* Make sure we are not in paged mode */
@@ -7721,9 +7498,10 @@ static BOOLEAN r56_memory_test( struct r56_struct *info )
 		writel(BitPatterns[i],TestAddr);
 		if ( readl(TestAddr) != BitPatterns[i] )
 		{
-			return FALSE;
+			return false;
 		}
 	}
+
 	/* Test address lines with incrementing pattern over */
 	/* entire address range. */
 
@@ -7744,7 +7522,7 @@ static BOOLEAN r56_memory_test( struct r56_struct *info )
 
 	memset( info->memory_base, 0, SHARED_MEM_ADDRESS_SIZE );
 
-	return TRUE;
+	return true;
 
 }	/* End Of r56_memory_test() */
 
@@ -7861,7 +7639,7 @@ static void r56_tx_timeout(unsigned long context)
 		info->icount.txtimeout++;
 	}
 	spin_lock_irqsave(&info->irq_spinlock,flags);
-	info->tx_active = 0;
+	info->tx_active = false;
 	info->xmit_cnt = info->xmit_head = info->xmit_tail = 0;
 
 	if ( info->params.flags & HDLC_FLAG_HDLC_LOOPMODE )
@@ -7869,7 +7647,12 @@ static void r56_tx_timeout(unsigned long context)
 
 	spin_unlock_irqrestore(&info->irq_spinlock,flags);
 	
-	r56_bh_transmit(info);
+#if R56_GENERIC_HDLC
+	if (info->netcount)
+		hdlcdev_tx_done(info);
+	else
+#endif
+		r56_bh_transmit(info);
 	
 }	/* end of r56_tx_timeout() */
 
@@ -7884,7 +7667,7 @@ static int r56_loopmode_send_done( struct r56_struct * info )
 	spin_lock_irqsave(&info->irq_spinlock,flags);
 	if (info->params.flags & HDLC_FLAG_HDLC_LOOPMODE) {
 		if (info->tx_active)
-			info->loopmode_send_done_requested = TRUE;
+			info->loopmode_send_done_requested = true;
 		else
 			usc_loopmode_send_done(info);
 	}
@@ -7898,7 +7681,7 @@ static int r56_loopmode_send_done( struct r56_struct * info )
  */
 static void usc_loopmode_send_done( struct r56_struct * info )
 {
- 	info->loopmode_send_done_requested = FALSE;
+ 	info->loopmode_send_done_requested = false;
  	/* clear CMR:13 to 0 to start echoing RxData to TxData */
  	info->cmr_value &= ~BIT13;			  
  	usc_OutReg(info, CMR, info->cmr_value);
@@ -7920,7 +7703,7 @@ static void usc_loopmode_cancel_transmit( struct r56_struct * info )
  */
 static void usc_loopmode_insert_request( struct r56_struct * info )
 {
- 	info->loopmode_insert_requested = TRUE;
+ 	info->loopmode_insert_requested = true;
  
  	/* enable RxAbort irq. On next RxAbort, clear CMR:13 to
  	 * begin repeating TxData on RxData (complete insertion)
@@ -7940,7 +7723,430 @@ static int usc_loopmode_active( struct r56_struct * info)
  	return usc_InReg( info, CCSR ) & BIT7 ? 1 : 0 ;
 }
 
-static int __devinit route56_init_one (struct pci_dev *dev,
+#if R56_GENERIC_HDLC
+
+/**
+ * called by generic HDLC layer when protocol selected (PPP, frame relay, etc.)
+ * set encoding and frame check sequence (FCS) options
+ *
+ * dev       pointer to network device structure
+ * encoding  serial encoding setting
+ * parity    FCS setting
+ *
+ * returns 0 if success, otherwise error code
+ */
+static int hdlcdev_attach(struct net_device *dev, unsigned short encoding,
+			  unsigned short parity)
+{
+	struct mgsl_struct *info = dev_to_port(dev);
+	unsigned char  new_encoding;
+	unsigned short new_crctype;
+
+	/* return error if TTY interface open */
+	if (info->port.count)
+		return -EBUSY;
+
+	switch (encoding)
+	{
+	case ENCODING_NRZ:        new_encoding = HDLC_ENCODING_NRZ; break;
+	case ENCODING_NRZI:       new_encoding = HDLC_ENCODING_NRZI_SPACE; break;
+	case ENCODING_FM_MARK:    new_encoding = HDLC_ENCODING_BIPHASE_MARK; break;
+	case ENCODING_FM_SPACE:   new_encoding = HDLC_ENCODING_BIPHASE_SPACE; break;
+	case ENCODING_MANCHESTER: new_encoding = HDLC_ENCODING_BIPHASE_LEVEL; break;
+	default: return -EINVAL;
+	}
+
+	switch (parity)
+	{
+	case PARITY_NONE:            new_crctype = HDLC_CRC_NONE; break;
+	case PARITY_CRC16_PR1_CCITT: new_crctype = HDLC_CRC_16_CCITT; break;
+	case PARITY_CRC32_PR1_CCITT: new_crctype = HDLC_CRC_32_CCITT; break;
+	default: return -EINVAL;
+	}
+
+	info->params.encoding = new_encoding;
+	info->params.crc_type = new_crctype;
+
+	/* if network interface up, reprogram hardware */
+	if (info->netcount)
+		mgsl_program_hw(info);
+
+	return 0;
+}
+
+/**
+ * called by generic HDLC layer to send frame
+ *
+ * skb  socket buffer containing HDLC frame
+ * dev  pointer to network device structure
+ */
+static netdev_tx_t hdlcdev_xmit(struct sk_buff *skb,
+				      struct net_device *dev)
+{
+	struct mgsl_struct *info = dev_to_port(dev);
+	unsigned long flags;
+
+	if (debug_level >= DEBUG_LEVEL_INFO)
+		printk(KERN_INFO "%s:hdlc_xmit(%s)\n",__FILE__,dev->name);
+
+	/* stop sending until this frame completes */
+	netif_stop_queue(dev);
+
+	/* copy data to device buffers */
+	info->xmit_cnt = skb->len;
+	mgsl_load_tx_dma_buffer(info, skb->data, skb->len);
+
+	/* update network statistics */
+	dev->stats.tx_packets++;
+	dev->stats.tx_bytes += skb->len;
+
+	/* done with socket buffer, so free it */
+	dev_kfree_skb(skb);
+
+	/* save start time for transmit timeout detection */
+	dev->trans_start = jiffies;
+
+	/* start hardware transmitter if necessary */
+	spin_lock_irqsave(&info->irq_spinlock,flags);
+	if (!info->tx_active)
+	 	usc_start_transmitter(info);
+	spin_unlock_irqrestore(&info->irq_spinlock,flags);
+
+	return NETDEV_TX_OK;
+}
+
+/**
+ * called by network layer when interface enabled
+ * claim resources and initialize hardware
+ *
+ * dev  pointer to network device structure
+ *
+ * returns 0 if success, otherwise error code
+ */
+static int hdlcdev_open(struct net_device *dev)
+{
+	struct mgsl_struct *info = dev_to_port(dev);
+	int rc;
+	unsigned long flags;
+
+	if (debug_level >= DEBUG_LEVEL_INFO)
+		printk("%s:hdlcdev_open(%s)\n",__FILE__,dev->name);
+
+	/* generic HDLC layer open processing */
+	if ((rc = hdlc_open(dev)))
+		return rc;
+
+	/* arbitrate between network and tty opens */
+	spin_lock_irqsave(&info->netlock, flags);
+	if (info->port.count != 0 || info->netcount != 0) {
+		printk(KERN_WARNING "%s: hdlc_open returning busy\n", dev->name);
+		spin_unlock_irqrestore(&info->netlock, flags);
+		return -EBUSY;
+	}
+	info->netcount=1;
+	spin_unlock_irqrestore(&info->netlock, flags);
+
+	/* claim resources and init adapter */
+	if ((rc = startup(info)) != 0) {
+		spin_lock_irqsave(&info->netlock, flags);
+		info->netcount=0;
+		spin_unlock_irqrestore(&info->netlock, flags);
+		return rc;
+	}
+
+	/* assert DTR and RTS, apply hardware settings */
+	info->serial_signals |= SerialSignal_RTS + SerialSignal_DTR;
+	mgsl_program_hw(info);
+
+	/* enable network layer transmit */
+	dev->trans_start = jiffies;
+	netif_start_queue(dev);
+
+	/* inform generic HDLC layer of current DCD status */
+	spin_lock_irqsave(&info->irq_spinlock, flags);
+	usc_get_serial_signals(info);
+	spin_unlock_irqrestore(&info->irq_spinlock, flags);
+	if (info->serial_signals & SerialSignal_DCD)
+		netif_carrier_on(dev);
+	else
+		netif_carrier_off(dev);
+	return 0;
+}
+
+/**
+ * called by network layer when interface is disabled
+ * shutdown hardware and release resources
+ *
+ * dev  pointer to network device structure
+ *
+ * returns 0 if success, otherwise error code
+ */
+static int hdlcdev_close(struct net_device *dev)
+{
+	struct mgsl_struct *info = dev_to_port(dev);
+	unsigned long flags;
+
+	if (debug_level >= DEBUG_LEVEL_INFO)
+		printk("%s:hdlcdev_close(%s)\n",__FILE__,dev->name);
+
+	netif_stop_queue(dev);
+
+	/* shutdown adapter and release resources */
+	shutdown(info);
+
+	hdlc_close(dev);
+
+	spin_lock_irqsave(&info->netlock, flags);
+	info->netcount=0;
+	spin_unlock_irqrestore(&info->netlock, flags);
+
+	return 0;
+}
+
+/**
+ * called by network layer to process IOCTL call to network device
+ *
+ * dev  pointer to network device structure
+ * ifr  pointer to network interface request structure
+ * cmd  IOCTL command code
+ *
+ * returns 0 if success, otherwise error code
+ */
+static int hdlcdev_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
+{
+	const size_t size = sizeof(sync_serial_settings);
+	sync_serial_settings new_line;
+	sync_serial_settings __user *line = ifr->ifr_settings.ifs_ifsu.sync;
+	struct mgsl_struct *info = dev_to_port(dev);
+	unsigned int flags;
+
+	if (debug_level >= DEBUG_LEVEL_INFO)
+		printk("%s:hdlcdev_ioctl(%s)\n",__FILE__,dev->name);
+
+	/* return error if TTY interface open */
+	if (info->port.count)
+		return -EBUSY;
+
+	if (cmd != SIOCWANDEV)
+		return hdlc_ioctl(dev, ifr, cmd);
+
+	switch(ifr->ifr_settings.type) {
+	case IF_GET_IFACE: /* return current sync_serial_settings */
+
+		ifr->ifr_settings.type = IF_IFACE_SYNC_SERIAL;
+		if (ifr->ifr_settings.size < size) {
+			ifr->ifr_settings.size = size; /* data size wanted */
+			return -ENOBUFS;
+		}
+
+		flags = info->params.flags & (HDLC_FLAG_RXC_RXCPIN | HDLC_FLAG_RXC_DPLL |
+					      HDLC_FLAG_RXC_BRG    | HDLC_FLAG_RXC_TXCPIN |
+					      HDLC_FLAG_TXC_TXCPIN | HDLC_FLAG_TXC_DPLL |
+					      HDLC_FLAG_TXC_BRG    | HDLC_FLAG_TXC_RXCPIN);
+
+		switch (flags){
+		case (HDLC_FLAG_RXC_RXCPIN | HDLC_FLAG_TXC_TXCPIN): new_line.clock_type = CLOCK_EXT; break;
+		case (HDLC_FLAG_RXC_BRG    | HDLC_FLAG_TXC_BRG):    new_line.clock_type = CLOCK_INT; break;
+		case (HDLC_FLAG_RXC_RXCPIN | HDLC_FLAG_TXC_BRG):    new_line.clock_type = CLOCK_TXINT; break;
+		case (HDLC_FLAG_RXC_RXCPIN | HDLC_FLAG_TXC_RXCPIN): new_line.clock_type = CLOCK_TXFROMRX; break;
+		default: new_line.clock_type = CLOCK_DEFAULT;
+		}
+
+		new_line.clock_rate = info->params.clock_speed;
+		new_line.loopback   = info->params.loopback ? 1:0;
+
+		if (copy_to_user(line, &new_line, size))
+			return -EFAULT;
+		return 0;
+
+	case IF_IFACE_SYNC_SERIAL: /* set sync_serial_settings */
+
+		if(!capable(CAP_NET_ADMIN))
+			return -EPERM;
+		if (copy_from_user(&new_line, line, size))
+			return -EFAULT;
+
+		switch (new_line.clock_type)
+		{
+		case CLOCK_EXT:      flags = HDLC_FLAG_RXC_RXCPIN | HDLC_FLAG_TXC_TXCPIN; break;
+		case CLOCK_TXFROMRX: flags = HDLC_FLAG_RXC_RXCPIN | HDLC_FLAG_TXC_RXCPIN; break;
+		case CLOCK_INT:      flags = HDLC_FLAG_RXC_BRG    | HDLC_FLAG_TXC_BRG;    break;
+		case CLOCK_TXINT:    flags = HDLC_FLAG_RXC_RXCPIN | HDLC_FLAG_TXC_BRG;    break;
+		case CLOCK_DEFAULT:  flags = info->params.flags &
+					     (HDLC_FLAG_RXC_RXCPIN | HDLC_FLAG_RXC_DPLL |
+					      HDLC_FLAG_RXC_BRG    | HDLC_FLAG_RXC_TXCPIN |
+					      HDLC_FLAG_TXC_TXCPIN | HDLC_FLAG_TXC_DPLL |
+					      HDLC_FLAG_TXC_BRG    | HDLC_FLAG_TXC_RXCPIN); break;
+		default: return -EINVAL;
+		}
+
+		if (new_line.loopback != 0 && new_line.loopback != 1)
+			return -EINVAL;
+
+		info->params.flags &= ~(HDLC_FLAG_RXC_RXCPIN | HDLC_FLAG_RXC_DPLL |
+					HDLC_FLAG_RXC_BRG    | HDLC_FLAG_RXC_TXCPIN |
+					HDLC_FLAG_TXC_TXCPIN | HDLC_FLAG_TXC_DPLL |
+					HDLC_FLAG_TXC_BRG    | HDLC_FLAG_TXC_RXCPIN);
+		info->params.flags |= flags;
+
+		info->params.loopback = new_line.loopback;
+
+		if (flags & (HDLC_FLAG_RXC_BRG | HDLC_FLAG_TXC_BRG))
+			info->params.clock_speed = new_line.clock_rate;
+		else
+			info->params.clock_speed = 0;
+
+		/* if network interface up, reprogram hardware */
+		if (info->netcount)
+			mgsl_program_hw(info);
+		return 0;
+
+	default:
+		return hdlc_ioctl(dev, ifr, cmd);
+	}
+}
+
+/**
+ * called by network layer when transmit timeout is detected
+ *
+ * dev  pointer to network device structure
+ */
+static void hdlcdev_tx_timeout(struct net_device *dev)
+{
+	struct mgsl_struct *info = dev_to_port(dev);
+	unsigned long flags;
+
+	if (debug_level >= DEBUG_LEVEL_INFO)
+		printk("hdlcdev_tx_timeout(%s)\n",dev->name);
+
+	dev->stats.tx_errors++;
+	dev->stats.tx_aborted_errors++;
+
+	spin_lock_irqsave(&info->irq_spinlock,flags);
+	usc_stop_transmitter(info);
+	spin_unlock_irqrestore(&info->irq_spinlock,flags);
+
+	netif_wake_queue(dev);
+}
+
+/**
+ * called by device driver when transmit completes
+ * reenable network layer transmit if stopped
+ *
+ * info  pointer to device instance information
+ */
+static void hdlcdev_tx_done(struct mgsl_struct *info)
+{
+	if (netif_queue_stopped(info->netdev))
+		netif_wake_queue(info->netdev);
+}
+
+/**
+ * called by device driver when frame received
+ * pass frame to network layer
+ *
+ * info  pointer to device instance information
+ * buf   pointer to buffer contianing frame data
+ * size  count of data bytes in buf
+ */
+static void hdlcdev_rx(struct mgsl_struct *info, char *buf, int size)
+{
+	struct sk_buff *skb = dev_alloc_skb(size);
+	struct net_device *dev = info->netdev;
+
+	if (debug_level >= DEBUG_LEVEL_INFO)
+		printk("hdlcdev_rx(%s)\n", dev->name);
+
+	if (skb == NULL) {
+		printk(KERN_NOTICE "%s: can't alloc skb, dropping packet\n",
+		       dev->name);
+		dev->stats.rx_dropped++;
+		return;
+	}
+
+	memcpy(skb_put(skb, size), buf, size);
+
+	skb->protocol = hdlc_type_trans(skb, dev);
+
+	dev->stats.rx_packets++;
+	dev->stats.rx_bytes += size;
+
+	netif_rx(skb);
+}
+
+static const struct net_device_ops hdlcdev_ops = {
+	.ndo_open       = hdlcdev_open,
+	.ndo_stop       = hdlcdev_close,
+	.ndo_change_mtu = hdlc_change_mtu,
+	.ndo_start_xmit = hdlc_start_xmit,
+	.ndo_do_ioctl   = hdlcdev_ioctl,
+	.ndo_tx_timeout = hdlcdev_tx_timeout,
+};
+
+/**
+ * called by device driver when adding device instance
+ * do generic HDLC initialization
+ *
+ * info  pointer to device instance information
+ *
+ * returns 0 if success, otherwise error code
+ */
+static int hdlcdev_init(struct mgsl_struct *info)
+{
+	int rc;
+	struct net_device *dev;
+	hdlc_device *hdlc;
+
+	/* allocate and initialize network and HDLC layer objects */
+
+	if (!(dev = alloc_hdlcdev(info))) {
+		printk(KERN_ERR "%s:hdlc device allocation failure\n",__FILE__);
+		return -ENOMEM;
+	}
+
+	/* for network layer reporting purposes only */
+	dev->base_addr = info->io_base;
+	dev->irq       = info->irq_level;
+	dev->dma       = info->dma_level;
+
+	/* network layer callbacks and settings */
+	dev->netdev_ops     = &hdlcdev_ops;
+	dev->watchdog_timeo = 10 * HZ;
+	dev->tx_queue_len   = 50;
+
+	/* generic HDLC layer callbacks and settings */
+	hdlc         = dev_to_hdlc(dev);
+	hdlc->attach = hdlcdev_attach;
+	hdlc->xmit   = hdlcdev_xmit;
+
+	/* register objects with HDLC layer */
+	if ((rc = register_hdlc_device(dev))) {
+		printk(KERN_WARNING "%s:unable to register hdlc device\n",__FILE__);
+		free_netdev(dev);
+		return rc;
+	}
+
+	info->netdev = dev;
+	return 0;
+}
+
+/**
+ * called by device driver when removing device instance
+ * do generic HDLC cleanup
+ *
+ * info  pointer to device instance information
+ */
+static void hdlcdev_exit(struct mgsl_struct *info)
+{
+	unregister_hdlc_device(info->netdev);
+	free_netdev(info->netdev);
+	info->netdev = NULL;
+}
+
+#endif /* CONFIG_HDLC */
+
+
+static int route56_init_one (struct pci_dev *dev,
 					const struct pci_device_id *ent)
 {
 	struct r56_struct *info;
@@ -7980,7 +8186,7 @@ static int __devinit route56_init_one (struct pci_dev *dev,
 	return 0;
 }
 
-static void __devexit route56_remove_one (struct pci_dev *dev)
+static void route56_remove_one (struct pci_dev *dev)
 {
 }
 

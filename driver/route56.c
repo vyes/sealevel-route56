@@ -872,11 +872,13 @@ static void* r56_get_text_ptr(void)
  * memory if large numbers of serial ports are open.
  */
 static unsigned char *tmp_buf;
+/*
 #ifdef DEFINE_SEMAPHORE
 static DEFINE_SEMAPHORE(tmp_buf_sem);
 #else
 static DECLARE_MUTEX(tmp_buf_sem);
 #endif
+*/
 
 static inline int r56_paranoia_check(struct r56_struct *info,
 					char *name, const char *routine)

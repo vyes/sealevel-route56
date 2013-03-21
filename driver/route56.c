@@ -4073,9 +4073,10 @@ static int r56_claim_resources(struct r56_struct *info)
 				goto errout;
 			}
 
-		info->lcr_mem_requested = 1;
+		info->lcr_mem_requested = true;
 
-		info->memory_base = ioremap_nocache(info->phys_memory_base,SHARED_MEM_ADDRESS_SIZE);
+		info->memory_base = ioremap_nocache(info->phys_memory_base,
+								SHARED_MEM_ADDRESS_SIZE);
 		if (!info->memory_base) {
 			printk( "%s(%d):Can't map shared memory on device %s MemAddr=%08X\n",
 				__FILE__,__LINE__,info->device_name, info->phys_memory_base );
@@ -4088,12 +4089,14 @@ static int r56_claim_resources(struct r56_struct *info)
 			goto errout;
 		}
 		
-		info->lcr_base = ioremap_nocache(info->phys_lcr_base,PAGE_SIZE) + info->lcr_offset;
+		info->lcr_base = ioremap_nocache(info->phys_lcr_base,
+								PAGE_SIZE);
 		if (!info->lcr_base) {
 			printk( "%s(%d):Can't map LCR memory on device %s MemAddr=%08X\n",
 				__FILE__,__LINE__,info->device_name, info->phys_lcr_base );
 			goto errout;
 		}
+		info->lcr_base += info->lcr_offset;
 		
 	} else {
 		/* claim DMA channel */

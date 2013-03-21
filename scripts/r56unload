@@ -1,0 +1,14 @@
+#!/bin/sh
+
+# Sample script to unload the Route56 device driver and 
+# HDLC line discipline driver
+#
+# $Id: r56unload,v 1.1 2007/04/13 13:17:56 thomasw Exp $
+
+# All utilities will be looked for in these directories, if you have
+# a nonstandard setup, you may have to add another directory to this list
+PATH=/sbin:/usr/sbin:/bin:/usr/bin
+
+
+( lsmod | grep -i "route56"    >/dev/null) && modprobe -r route56
+( lsmod | grep -i "n_hdlc"     >/dev/null) && modprobe -r n_hdlc

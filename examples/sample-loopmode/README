@@ -1,0 +1,314 @@
+---------------------------------------------------------------------------
+                         SLHDLC Loop Mode Sample
+---------------------------------------------------------------------------
+
+This directory contains an HDLC/SDLC Loop Mode Sample Programs. Below is a
+list of the files:
+
+        README.TXT      This file.
+
+        common.c        Routines common to both the Primary and Secondary
+        common.h        (slave) stations.
+
+        profile.c       Routines for loading configuration information for
+        profile.h       Primary and Secondary (slave) stations from
+                        configuration profiles (.ini files).
+
+	primary		Primary sample executable.
+
+        primary.c       Source for Primary test station.
+        primary.h
+
+	secondary	Secondary sample executable.
+
+        secondary.c     Source for Secondary (slave) test stations.
+        secondary.h
+
+	Makefile	makefile used to build sample programs.
+
+        primary.ini     Profile used by Primary in test demonstration.
+
+        slave1.ini      Profile used by first Secondary station in test
+                        demonstration.
+
+        slave2.ini      Profile used by second Secondary station in test
+                        demonstration.
+
+---------------------------------------------------------------------------
+                                 Summary
+---------------------------------------------------------------------------
+
+These samples are for demonstration purposes only and can be used as a
+starting point for a developer's HDLC/SDLC Loop Mode application. These
+samples use a simple protocol that is not meant to mimic any known or
+established protocol. These samples also lack error recovery and frame
+retransmission and just demonstrate basic HDLC/SDLC Loop Mode behavior.
+
+In this group of sample programs, the Primary station functions in normal
+HDLC mode and controls two Secondary stations running in a HDLC/SDLC Loop
+Mode configuration. The Primary station has it's runtime configuration
+stored in PRIMARY.INI and each of the Secondary stations have their
+runtime configuration stored in SLAVE1.INI and SLAVE2.INI.
+
+To run the samples, simply run the following commands:
+
+	# secondary slave1.ini
+	# secondary slave2.ini
+	# primary primary.ini
+
+The samples are basic console type applications and output status
+information to the console or tty device.
+
+The test system used to run these samples included three Sealevel
+Route56 adapters in one system. These tests were run in an X-Windows
+environment with three shell prompt windows open. Each window had one of
+the above commands executing so that the output from all three sessions
+was visible at one time.
+
+---------------------------------------------------------------------------
+                      HDLC/SDLC Loop Mode Operation
+---------------------------------------------------------------------------
+
+For HDLC/SDLC Loop Mode, there is one primary station that controls all
+Secondary stations in a loop. The loop consists of multiple adapters
+cabled together such that the one station's transmit data pin is connected
+to the next station's receive data pin. For example:
+
+
+[Primary] --Tx-> --Rx->[Secondary1]--Tx-> --Rx->[Secondary2]-|
+  ^                                                          Tx
+  |                                                          |
+  Rx <-------------------------------------------------------|
+
+
+There is a signal ground also in this wiring configuration. For the most
+part, HDLC/SDLC Loop Mode uses Digital Phase Lock Loop to have the receive
+clock extracted from the input RxData signal. But, the primary can be
+configured to generate a clock which can then be cabled in such a way that
+it propagates to each secondary stations RxClk/TxClk input pins.
+
+
+---------------------------------------------------------------------------
+               SLHDLC Primary Station Configuration/Setup
+---------------------------------------------------------------------------
+
+The primary station will operate in normal HDLC/SDLC mode and should set
+the following items in the R56_PARAMS structure passed to the
+R56_IOCSPARAMS device I/O control request in addition to any other
+application specific settings:
+
+        mode =  R56_MODE_HDLC
+
+        flags = HDLC_FLAG_UNDERRUN_ABORT7 | HDLC_FLAG_TXC_RXCPIN | \
+                HDLC_FLAG_RXC_RXCPIN
+
+        addr_filter =  0xff
+
+        clock_speed = 9600
+
+For HDLC/SDLC Loop Mode, the transmit clock and receive clock must come
+from the same source. The above configures the adapter to use the RxClock
+input pin as the source for the Tx Clock (HDLC_FLAG_TXC_RXCPIN). See
+Digital Phase Lock Loop (DPLL) below for DPLL configuration.
+
+The primary station must set a station address of 0xff to receive all
+incoming frames from all secondary stations.
+
+The primary station MUST also set the transmit idle character to all ones
+by calling specifying a value of HDLC_TXIDLE_ONES in the R56_IOCSTXIDLE
+device I/O control request . This will ensure that a GoAhead sequence (0
+followed by seven 1s) is generated for downstream secondary stations. In
+HDLC/SDLC Loop mode, a secondary station will complete entry into the loop
+when the GoAhead sequence is received. Also, secondary stations cannot
+start transmitting until the GoAhead sequence is received.
+
+If the primary station has to transmit more than one frame of data, it
+should first make the R56_IOCSTXIDLE device I/O control request with the
+HDLC_TXIDLE_FLAGS option in order to idle flag characters between
+consecutive transmit frames. The primary station MUST make the
+R56_IOCSTXIDLE device I/O control request with HDLC_TXIDLE_ONES after the
+last transmit request, whether the transmit was successful or not. By
+doing so, the primary station generates a GoAhead sequence for the
+downstream secondary stations.
+
+---------------------------------------------------------------------------
+              SLHDLC Secondary Station Configuration/Setup
+---------------------------------------------------------------------------
+
+The secondary station should set the following items in the R56_PARAMS
+structure passed to the R56_IOCSPARAMS device I/O control request - in
+addition to any other application specific settings:
+
+        mode =  R56_MODE_HDLC
+
+        flags = HDLC_FLAG_UNDERRUN_FLAGS | \
+                HDLC_FLAG_HDLC_LOOPMODE | \
+                HDLC_FLAG_TXC_RXCPIN | \
+                HDLC_FLAG_RXC_RXCPIN
+
+        clock_speed = 9600
+
+For HDLC/SDLC Loop Mode, the transmit clock and receive clock must come
+from the same source. The above configures the adapter to use the RxClock
+input pin as the source for the Tx Clock (HDLC_FLAG_TXC_RXCPIN). See
+Digital Phase Lock Loop (DPLL) below for DPLL configuration.
+
+The address specified in the addr_filter field of the R56_PARAMS
+structure must be unique and not conflict with another station in that
+loop configuration.
+
+Since the primary station controls the flow of data round a loop, the
+secondary station must never transmit a GoAhead sequence, so specify a
+value HDLC_FLAG_UNDERRUN_FLAGS in the R56_PARAMS structure when making
+the R56_IOCSPARAMS device I/O control request to idle flags in the event
+that an underrun occurs. The secondary station should ALWAYS call specify
+a value of HDLC_TXIDLE_FLAGS when making the R56_IOCSTXIDLE device I/O
+control request to always idle flags characters before enabling the
+transmitter by using the R56_IOCTXENABLE device I/O control request with
+a non-zero value.
+
+The adapter driver will begin to insert itself into the loop once the
+transmitter is enabled using the R56_IOCTXENABLE device I/O control
+request with a non-zero value. Once the adapter driver sees a GoAhead
+sequence, the station's insertion into the loop is complete and the
+adapter is considered OnLoop. At this point, all data received on the
+receive data pin is echoed automatically on the transmit data pin. This
+loop mode is maintained until the application disables the transmitter
+using the R56_IOCTXENABLE device I/O control request with a
+value of zero, or closes the port.
+
+Note:   Disabling the transmitter or closing the HDLC Port (which resets
+        the adapter) will terminate the loop at that workstation since the
+        transmitter has to be active in order to echo received data to
+        transmit data automatically in a loop mode configuration.
+
+Until the adapter is OnLoop, all transmit requests are blocked (if the
+device is operating in blocked mode) or fail with errno set to EAGAIN -
+indicate the driver cannot accept a transmit request - if the device is
+operating in non-blocked mode). The application can use the R56_IOCGSTATS
+device I/O control request before enabling the transmitter using the
+R56_IOCTXENABLE device I/O control request and after enabling the
+transmitter and monitor the value of the 'rxabort' element of the
+r56_icount structure. The receipt of an abort sequence (GoAhead) when the
+transmitter is first enabled indicates the adapter is OnLoop.
+
+The secondary station will receive all frames addressed specifically to
+that station's configured address and all broadcast frames. When the
+secondary station starts a transmit by making a write() call, the adapter
+driver will actually begin the transmit operation, but the data will not
+be transmitted until receipt of then next GoAhead sequence.
+
+If the secondary station is going to send more than one frame of data, it
+should make a write() request for each frame of data it has queued for
+transmission. The secondary station MUST call make the R56_IOCLOOPTXDONE
+device I/O control request after the last frame of data as been passed to
+the write() call. This will allow the adapter to transition from active
+send mode to repeat mode and begin repeating received data on the transmit
+pin automatically after the last frame is transmitted. The
+R56_IOCLOOPTXDONE device I/O control request can be made immediately
+after the call to write() for the last frame. This will ensure that the
+adapter goes back to an repeat mode immediately after the transmit
+completes.
+
+If the application fails to make the R56_IOCLOOPTXDONE device I/O control
+request, that station will continuing streaming flags and no longer repeat
+received data to other downstream secondary stations until this call is
+made.
+
+Note:   Making an R56_IOCTXABORT device I/O control request to cancel a
+        transmit in progress will automatically perform the
+        R56_IOCLOOPTXDONE internally within the driver. Also making the
+        R56_IOCTXABORT device I/O control request will not cause an abort
+        sequence to be transmitted while operating in HDLC/SDLC Loop Mode.
+
+---------------------------------------------------------------------------
+                         Digital Phase Lock Loop
+---------------------------------------------------------------------------
+
+For HDLC/SDLC Loop Mode using DPLL (Digital Phase Lock Loop), all stations
+must set the same clock rate in the clock_speed element of the R56_PARAMS
+structure passed in the R56_IOCSPARAMS device I/O control request.
+
+The primary station must specify the following flags in the R56_PARAMS
+sturcutre passed in the R56_IOCSPARAMS device I/O control request - in
+addition to any others that may be application specific:
+
+        HDLC_FLAG_UNDERRUN_ABORT7       to send an abort in the event of a
+                                        transmit underrun.
+
+        HDLC_FLAG_RXC_DPLL              Rx Clock from DPLL.
+
+        HDLC_FLAG_TXC_BRG               Tx Clock from baud rate generator.
+
+        HDLC_FLAG_DPLL_DIV32,           DPLL divisor (see help the
+        HDLC_FLAG_DPLL_DIV16,           Programming.txt document for more
+        or HDLC_FLAG_DPLL_DIV8          information on DPLL operation).
+
+        HDLC_ENCODING_NRZI_SPACE for the HDLC encoding
+
+The secondary station(s) must specify the following flags in the
+R56_PARAMS sturcutre passed in the R56_IOCSPARAMS device I/O control
+request - in addition to any others that may be application specific:
+
+        HDLC_FLAG_UNDERRUN_FLAG         Always idle flag characters in the
+                                        event of an transmit underrun.
+
+        HDLC_FLAG_HDLC_LOOPMODE         Request for Loop Mode operation.
+
+        HDLC_FLAG_TXC_DPLL              Tx Clock from DPLL.
+
+        HDLC_FLAG_RXC_DPLL              Rx Clock from DPLL.
+
+        HDLC_ENCODING_NRZI_SPACE        for the HDLC encoding.
+
+---------------------------------------------------------------------------
+                        Sample Program Operation
+---------------------------------------------------------------------------
+
+In the sample programs included in this directory, the primary station
+acts as a receiver for secondary transactions.
+
+At the start the primary station transmits a general poll (FF 11). When a
+secondary station sees a such a general poll, it transmits a Set
+Initialization Mode request (xx 17, where xx is that secondary station's
+address). When the primary station sees this request, it will allocate
+resources to converse with this secondary station. If successful, the
+primary transmits a Set Initialization Mode response (xx 17 xx, where xx
+is that secondary station's address). When the secondary station sees this
+response, it is considered initialized and is ready to communicate.
+
+In this sample, the secondary stations generates a new transaction at a
+defined interval (specified by the value of NewTransactionInterval key in
+the secondary's configuration profile). A transaction is merely a
+structure that contains a sequential transaction number and other fields
+used to time transaction processing (see COMMON.H for the definition of
+APP_TRANSACTION). When a new transaction is generated, it is placed on a
+list of transactions queued for transmission to the primary.
+
+Upon receipt of a general poll, a secondary station will begin to transmit
+all queued transactions or a poll response if there are no transactions
+queued. All transactions successfully transmitted are then moved to
+another list of transactions waiting for a response.
+
+The primary station will poll at a defined interval. After a poll, it will
+wait for a defined period of time and receive all incoming frames during
+this time. All received information frames are considered incoming
+transactions from the secondary stations. These transactions are placed in
+a list of transaction waiting for a response. During the next poll
+interval, all pending transactions are timestamped and transmitted to the
+secondary station(s). If there are no transaction waiting to be
+transmitted back to the secondary stations, the primary merely sends a
+general poll and begins the wait/receive cycle again.
+
+Once a secondary station receives an information frame, it will match the
+incoming transaction's sequence number and original timestamp field to
+those in the list of transactions waiting for a response. Once a match is
+found, the transaction is removed from this waiting for response list and
+considered complete.
+
+This test continues forever unless the value specified by the
+NumTransactions in the secondary's configuration profile is set to a
+non-zero value, which will then limit the number of transactions to the
+specified value.
+
+For more details or specifics, refer to the source file comments.

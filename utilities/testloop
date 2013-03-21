@@ -1,0 +1,112 @@
+#!/bin/sh
+
+# $Id: testloop,v 1.1 2007/04/13 13:17:56 thomasw Exp $
+#
+# send and receive blocks of data through a
+# Route56 adapter in loopback mode
+
+if ( [ ! -z $1 ] ) then
+	DEVICE=$1
+else
+	DEVICE=/dev/ttySL0
+fi
+
+#
+# verify presense of necessary utility programs to run test
+#
+PATH="/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:../scripts"
+
+#####################################################
+#
+# SPECIFY TEST OPTIONS
+#
+
+# MODE : hdlc (bit synchronous HDLC) or async (asynchronous)
+MODE=hdlc
+#MODE=async
+
+# internal - data is looped internally in serial controller
+# external - external loopback device must be connected to serial connector
+LOOPBACK=internal
+#LOOPBACK=external
+
+# bit synchronous clock source (default is baud rate generator)
+CLOCKS="txbrg rxbrg"
+
+# speed in bits per second
+SPEED=200000
+
+# serial interface standard for adapters with software
+# selectable serial interfaces (rs232, v35, rs422, ...)
+IF="rs232"
+
+if [ ${LOOPBACK} = external ] ; then
+    LOOPBACK_OPT="-loopback"
+else	
+    LOOPBACK_OPT="+loopback"
+fi	
+
+# to allow receipt of packets with CRC errors, uncomment one
+# of the following entries (only valid with SyncLink WAN Adapter)
+#CRC_EX=crc16ex
+#CRC_EX=crc32ex
+
+# size in bytes of each data packet
+SIZE=512
+
+# count of data packets to send and receive
+COUNT=10
+	
+echo
+echo $LOOPBACK loopback test on $DEVICE, mode=$MODE speed=$SPEED, $COUNT Packets of $SIZE bytes
+
+######################################################
+#
+# Check for device drivers loaded and nodes made
+#
+( lsmod | grep -i "route56"    >/dev/null) || { 
+    echo "ERROR:  Route56 driver is not loaded,"
+    echo "         please exectue r56load"
+    exit 1 
+}
+
+( lsmod | grep -i "n_hdlc"     >/dev/null) || { 
+    echo "ERROR:  N_HDLC driver is not loaded,"
+    echo "         please execute r56load"
+    exit 1
+}
+
+[ -c $DEVICE ] || {
+    echo "ERROR:  Device node($DEVICE) doesn't exist!"
+    echo "         please execute r56load"
+    exit 1
+}
+
+
+######################################################
+#
+# CONFIGURE HARDWARE WITH OPTIONS SPECIFIED ABOVE
+#
+if ( [ $MODE == hdlc ] ) then
+    # HDLC mode
+    # configure device with mgslutil
+    r56util $DEVICE quiet hdlc idle1 $IF clock $SPEED $CLOCKS $LOOPBACK_OPT $CRC_EX
+else
+    # asynchronous mode
+    # configure synclink specific settings with mgslutil
+    # configure termios settings with stty
+    r56util $DEVICE quiet async nrz idle1 $IF $LOOPBACK_OPT &&
+    stty --file=$DEVICE $SPEED \
+	-icanon -echo -echoctl -echonl -isig -noflsh -iexten \
+	-onlcr -opost -olcuc -onocr -ocrnl -onlret \
+	-icrnl -inpck -istrip -iuclc -ixoff -ixon -igncr \
+	-hupcl cs8 -parenb -cstopb -crtscts clocal cread min 1 time 0
+fi
+
+#####################################################
+#
+# EXECUTE THE TEST
+#
+r56test $DEVICE size $SIZE count $COUNT $CRC_EX
+
+exit 0

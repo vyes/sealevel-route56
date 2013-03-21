@@ -1,0 +1,1081 @@
+
+**********************************
+*** Custom Serial Applications ***
+**********************************
+
+This document describes the programming interface
+used by custom serial communications applications.
+This interface uses the standard Linux system calls
+and tty/termios functions.
+
+Sample applications are included for each serial protocol
+and are the best place to start for understanding the interface.
+
+    sample-hdlc        bit synchronous HDLC application
+    sample-raw         bit synchronous raw application
+    sample-async       asynchronous application
+
+Applications must include the "route56.h" header file.
+
+Contents
+--------
+Overview
+Open/Close Device
+Configure Device
+Receiving Data
+Sending Data
+Ioctl() codes
+DPLL Clock Recovery
+bit synchronous raw mode(no framing or synchronization)
+extended eeceive mode (return CRC/indications)
+
+
+****************
+*** Overview ***
+****************
+
+The device interface uses standard Linux system calls and tty/termios functions:
+
+System Calls
+------------
+open()      open handle to device (required for other calls)
+read()      get received data
+write()     send data
+ioctl()     monitor/control/configure device
+close()     release handle to device
+
+tty/termios Functions
+---------------------
+tcdrain()
+
+For more information about system calls,
+refer to the man pages or other documentation.
+
+
+*************************
+*** Open/Close Device ***
+*************************
+
+   char devname[] = "/dev/ttySL0"; /* device name */
+   int fd;                         /* file descriptor */
+
+   fd = open(devname, O_RDWR | O_NONBLOCK, 0);
+   ...
+   close(fd);
+
+open() returns a file descriptor for use with other functions.
+O_RDWR is required to send and receive data.
+O_NONBLOCK causes open() to return without waiting for
+the serial status signal DCD to be active.
+
+close() releases the file descriptor when done.
+
+
+************************
+*** Configure Device ***
+************************
+
+The application must configure the device before use. This is done using
+ioctl() calls as described below in the sections for R56_IOCSPARAMS
+(Set Parameters) and R56_IOCSTXIDLE (Set Transmit Idle Mode).
+The specific options are application dependent.
+
+
+**********************
+*** Receiving Data ***
+**********************
+
+   int fd;                        /* open file descriptor */
+   char buf[HDLC_MAX_FRAME_SIZE]; /* buffer for received frame */
+   int size = sizeof(buf);        /* size of buffer */
+   int rc;                        /* read() return value */
+
+   rc = read(fd, buf, size);
+   if (rc < 0) {
+      /* process error */
+   } else {
+      /* process rc bytes of data */
+   }
+
+HDLC mode
+---------
+read() returns a complete frame of data,
+including the address and control fields but not the
+CRC value or leading/closing flags. Usually frames with CRC errors
+are discarded by the driver and are not seen by the application.
+If a frame is larger than buf, read() returns -1 and errno is
+set to EOVERFLOW.
+
+The driver discards valid frames with address fields other than
+the broadcast address (0xFF) or the addr_filter field of the
+R56_PARAMS structure. If addr_filter is set to 0xFF, all frames
+are passed to application without regard for the address field.
+
+Asynchronous mode
+-----------------
+read() returns one or more data characters.
+
+Raw mode
+-----------------------------
+read() returns a full device buffer of data (usually 256 bytes).
+
+General
+-------
+O_NONBLOCK cleared (blocking mode): read() blocks
+until data is available.
+
+O_NONBLOCK set (polling mode): read() returns immediately,
+either with data (rc > 0) or a return value of -1 and
+errno set to EAGAIN.
+
+The application enables/disables the receiver with ioctl(R56_IOCRXENABLE).
+Data is never returned while the receiver is disabled.
+
+If HDLC_FLAG_AUGO_DCD is set in the flags field of the R56_PARAMS
+structure, the receiver only received data when the serial signal DCD is on.
+
+
+********************
+*** Sending Data ***
+********************
+
+   int fd;                        /* open file descriptor */
+   char buf[HDLC_MAX_FRAME_SIZE]; /* buffer for send frame */
+   int size;                      /* size of data in buffer */
+   int rc;                        /* write() return value */
+
+   /* initialize buf with send data */
+   /* initialize size with count of send data bytes */
+
+   rc = write(fd, buf, size);
+   if (rc < 0) {
+      /* process error */
+   } else {
+      /* rc bytes of data successfully sent */
+   }
+
+HDLC mode
+---------
+write() sends one frame. buf contains the HDLC information
+field, including the address and control fields. The hardware
+adds the CRC (if enabled) and opening/closing flags.
+size must be at least 2 (smallest valid HDLC frame).
+ioctl(R56_IOCTXABORT) aborts a send frame in progress with
+an HDLC abort sequence (at least 7 contiguous ones).
+
+Asynchronous mode
+-----------------
+write() sends one or more bytes of asynchronous data.
+
+Bit Synchronous Raw mode
+------------------------
+write() sends a buffer of raw data.
+
+General
+-------
+O_NONBLOCK clear (blocking mode)
+write() blocks until data is accepted and
+rc is set to size on return.
+
+O_NONBLOCK set (polling mode)
+write() accepts data and rc is set to size,
+or rc is set to -1 and errno is set to EAGAIN indicating
+the application should try again later. EAGAIN occurs if
+all send buffers are full.
+
+write() returns before all data has been sent. The data
+is buffered in the driver and hardware. Use the function
+tcdrain() or ioctl(TIOCOUTQ) to determine when all data
+has been sent.
+
+write() enables the transmitter if not already enabled.
+The transmitter remains enabled until the application calls
+ioctl(R56_IOCTXENABLE, FALSE). An enabled transmitter sends the
+configured idle pattern when not sending data.
+
+If HDLC_FLAG_AUTO_CTS is set in the flags field of the R56_PARAMS
+structure, the adapter to wait until CTS is on before sending data.
+If CTS turns off while sending data, the transmission stops.
+In HDLC mode, CTS turning off while sending aborts the HDLC frame.
+
+If HDLC_FLAG_AUTO_RTS is set in the flags field of the R56_PARAMS
+structure, the driver turns on RTS before sending data and turns off
+RTS after sending data. If RTS is already active before calling write(),
+then the driver does not manipulate RTS. If an application
+requires a delay between the end of sending data and turning off RTS,
+the application should manually control RTS and clear HDLC_FLAG_AUTO_RTS.
+
+
+*********************
+*** ioctl() codes ***
+*********************
+
+Standard tty ioctl() codes
+--------------------------
+
+   TIOCMGET      get modem control and status signal states
+
+   TIOCMBIS      enable specified modem control signals
+   TIOCMBIC      disable specified modem control signals
+   TIOCMSET      set state of specified modem control signals
+
+   TIOCMIWAIT    wait for serial status signal changes
+
+   TIOCGICOUNT   get count of serial status signal changes
+
+   TIOCOUTQ      get count of pending send data
+
+Route56 Specific ioctl() codes
+-------------------------------
+
+   R56_IOCGPARAMS      get device configuration
+   R56_IOCSPARAMS      set device configuration
+
+   R56_IOCGTXIDLE      get transmit idle mode
+   R56_IOCSTXIDLE      set transmit idle mode
+
+   R56_IOCTXENABLE     enable/disable transmitter
+   R56_IOCRXENABLE     enable/disable receiver
+
+   R56_IOCTXABORT      abort HDLC send frame in progress
+
+   R56_IOCGSTATS       get device statistics or
+                        reset statistics if ioctl argument is NULL
+
+   R56_IOCWAITEVENT    wait for specified event
+
+
+TIOCMGET - Get Modem Signals
+----------------------------
+
+   int sigs;
+   rc = ioctl(fd, TIOCMGET, &sigs);
+
+Return serial control and status signals in sigs argument.
+Active signals are indicated with following bit definitions:
+
+   TIOCM_RTS   Request To Send (output signal)
+   TIOCM_DTR   Data Terminal Ready (output signal)
+   TIOCM_CAR   Data Carrier Detect (input signal)
+   TIOCM_RNG   Ring Indicator (input signal)
+   TIOCM_DSR   Data Set Ready (input signal)
+   TIOCM_CTS   Clear To Send (input signal)
+
+
+TIOCMBIS   enable modem control signals
+---------------------------------------
+   int sigs = TIOCM_RTS | TIOCM_DTR
+   rc = ioctl(fd, TIOCMBIS, &sigs);
+
+Enable modem control signals specified by sigs argument.
+Enabled signals are indicated with the following bit definitions,
+with other signals left in the current state:
+
+   TIOCM_RTS   Request To Send (output signal)
+   TIOCM_DTR   Data Terminal Ready (output signal)
+
+
+TIOCMBIC   disable modem control signals
+---------------------------------------
+   int sigs = TIOCM_RTS | TIOCM_DTR
+   rc = ioctl(fd, TIOCMBIC, &sigs);
+
+Disable modem control signals specified by sigs argument.
+Disabled signals are indicated with the following bit definitions,
+with other signals left in the current state:
+
+   TIOCM_RTS   Request To Send
+   TIOCM_DTR   Data Terminal Ready
+
+
+TIOCMSET   set modem control signal states
+------------------------------------------
+
+   int sigs = TIOCM_RTS | TIOCM_DTR
+   rc = ioctl(fd, TIOCMSET, &sigs);
+
+Set state of modem control signals specified by sigs argument.
+Enabled signals are indicated with the following bit definitions,
+other signals are disabled.
+
+   TIOCM_RTS   Request To Send
+   TIOCM_DTR   Data Terminal Ready
+
+
+TIOCMIWAIT - wait for serial status signals to change
+-----------------------------------------------------
+
+   int sigs = TIOCM_RNG | TIOCM_DSR | TIOCM_CD | TIOCM_CTS;
+   rc = ioctl(fd, TIOCMGET, &sigs);
+
+Wait for one or more serial status signals to change. Specify signals
+of interest with the following bit definitions:
+
+   TIOCM_CAR   Data Carrier Detect
+   TIOCM_RNG   Ring Indicator
+   TIOCM_DSR   Data Set Ready
+   TIOCM_CTS   Clear To Send
+
+On return, the application should use ioctl(TIOCGICOUNT)
+(Get Input Counts) to see which signal(s) changed.
+
+
+TIOCGICOUNT - get count of serial status signal changes
+-------------------------------------------------------
+
+   struct serial_icounter_struct icount;
+   rc = ioctl(fd, TIOCGICOUNT, &icount);
+
+Return a serial_icounter_struct structure with counts of serial
+status signal changes and line errors.
+
+serial_icounter_struct is typically found in
+/usr/include/linux/serial.h and is defined as:
+
+   struct serial_icounter_struct {
+      int cts, dsr, rng, dcd;
+      int rx, tx;
+      int frame, overrun, parity, brk;
+      int buf_overrun;
+      int reserved[9];
+   };
+
+   cts             number of transitions in Clear to Send (CTS).
+   dsr             number of transitions in Data Set Ready (DSR).
+   rng             number of transitions in Ring Indicator (RI).
+   dcd             number of transitions in Data Carrier Detect (DCD).
+   rx              number of received asynchronous data bytes.
+   tx              number of transmitted asynchronous data bytes.
+   frame           number of asynchronous framing errors detected.
+   overrun         number of asynchronous receive overruns detected.
+   parity          number of asynchronous parity errors detected.
+   brk             number of asynchronous break sequences detected.
+   buf_overrun     number of times the driver's receive data buffer overflowed.
+
+
+TIOCOUTQ - get count of pending send data
+-----------------------------------------
+   int count;
+   rc = ioctl(fd, TIOCOUTQ, &count);
+
+Returns a byte count of pending send data. This can be used to
+poll a device for send completion. When rc is zero, all data
+has been sent.
+
+
+R56_IOCGPARAMS - get device configuration
+------------------------------------------
+
+   R56_PARAMS params;
+   rc = ioctl(fd, R56_IOCGPARAMS, &params);
+
+Returns the device configuration in a R56_PARAMS structure.
+See R56_IOCSPARAMS for more information about the R56_PARAMS structure.
+
+
+R56_IOCSPARAMS - set device configuration
+------------------------------------------
+
+   R56_PARAMS params;
+   params.mode = R56_MODE_HDLC;
+   params.loopback = 0;
+   /* ... other application defined settings ... */
+
+   rc = ioctl(fd, R56_IOCSPARAMS, &params);
+
+Set device configuration specified by R56_PARAMS structure.
+
+The R56_PARAMS structure is defined in route56.h:
+
+   typedef struct _R56_PARAMS
+   {
+      /* Common */
+
+      unsigned long  mode;          /* HDLC, async, or raw */
+      unsigned char  loopback;      /* internal loopback mode */
+      unsigned char  interface;     /* RS-232/530/485/whatever */
+
+      /* synchronous modes */
+
+      unsigned short flags;
+      unsigned char  encoding;      /* NRZ, NRZI, etc. */
+      unsigned long  clock_speed;   /* external clock speed in bits per second*/
+      unsigned char  addr_filter;   /* receive HDLC address filter */
+      unsigned short crc_type;      /* None, CRC16-CCITT, or CRC32-CCITT */
+      unsigned char  preamble_length;
+      unsigned char  preamble;
+
+      /* (ignored by driver, use termios calls for async) */
+
+      unsigned long  data_rate;
+      unsigned char  data_bits;
+      unsigned char  stop_bits;
+      unsigned char  parity;
+
+   } R56_PARAMS, *PR56_PARAMS;
+
+Note: Many constants are defined as HDLC_XXX for historical reasons,
+but apply to all synchronous modes (raw/HDLC).
+
+   mode        communications mode/protocol
+
+               R56_MODE_ASYNC     character oriented, no external clocks
+                                   per character hardware framing
+                                   per character parity check (none/even/odd)
+
+               R56_MODE_HDLC      bit synchronous
+                                   hardware framing and synchronization (flags)
+                                   hardware transparency (0 bit stuff/removal)
+                                   hardware CRC check/generation (none/16 bit/
+				   32 bit)
+
+               R56_MODE_RAW       bit synchronous
+                                   no hardware framing, synchronization, or 
+				   transparency
+
+
+   loopback    If non-zero, transmit data is looped back internally to
+               receive data. Loopback mode is useful for diagnostics.
+
+
+   interface   This parameter is used to set the device's electrical interface.
+               Setting this feature is not available in all models - check your
+               device manual.
+
+               RS232              RS-232 is capable of operating at data rates
+                                  up to 20 Kbps at distances less than 50 ft.
+                                  The absolute maximum data rate may vary due to
+                                  line conditions and cable lengths. RS-232
+                                  often operates at 38.4 Kbps over very short
+                                  distances. The voltage levels defined by
+                                  RS-232 range from -12 to +12 volts. RS-232 is
+                                  a single ended or unbalanced interface,
+                                  meaning that a single electrical signal is
+                                  compared to a common signal (ground) to
+                                  determine binary logic states. A voltage of
+                                  +12 volts (usually +3 to +10 volts) represents
+                                  a binary 0 (space) and -12 volts 
+                                  (-3 to -10 volts) denotes a binary 1 (mark).
+
+               RS485_NOTERM       RS-485 is backwardly compatible with RS-422;
+                                  however, it is optimized for partyline or
+                                  multi-drop applications. The output of the
+                                  RS-422/485 driver is capable of being Active
+                                  (enabled) or Tri-State (disabled). This 
+                                  capability allows multiple ports to be
+                                  connected in a multi-drop bus and selectively
+                                  polled. RS-485 allows cable lengths up to 4000
+                                  feet and data rates up to 10 Megabits per
+                                  second. The signal levels for RS-485 are the
+                                  same as those defined by RS-422.
+               
+               RS485_NOTERM_NE    This is the same as RS485_NOTERM with the
+                                  exception that it automatically disables the
+                                  receiver during transmit.  In normal 2-wire
+                                  rs-485 everything that is transmitted is also
+                                  echoed back to the sender.  With this selected
+                                  the Route56 driver will disable the receiver
+                                  at the begining of transmission, then enable
+                                  the reciever when the transmission is done.
+                                  
+               RS485_TERM         This is the same as RS485_NOTERM, except there
+                                  is a resistance placed between the + and -
+                                  lines.  This mode of operation is required to
+                                  maintain line conditions in a multidrop
+                                  network on both the first and last devices.
+                                  For example if you have 9 devices, device 0
+                                  and device 8 should enable RS485_TERM.
+                                  T===NT===NT===NT===NT===NT===NT===NT===T
+                                  0    1    2    3    4    5    6    7   8
+              
+               RS485_TERM_NE      This is the same as RS485_NOTERM with the
+                                  exception that it automatically disables the
+                                  receiver during transmit.  In normal 2-wire
+                                  rs-485 everything that is transmitted is also
+                                  echoed back to the sender.  With this selected
+                                  the Route56 driver will disable the receiver
+                                  at the begining of transmission, then enable
+                                  the reciever when the transmission is done.
+
+               RS530              RS-530 (a.k.a. EIA-530) compatibility means
+                                  that RS-422 signal levels are met, and the
+                                  pin-out for the DB-25 connector is specified.
+                                  The EIA (Electronic Industry Association) 
+                                  created the RS-530 specification to detail
+                                  the pin-out, and define a full set of modem 
+                                  control signals that can be used for 
+                                  regulating flow control and line status.
+                                  The Sealevel adapter is a DTE interface.
+
+
+               RS530A             The major difference between RS-530 and 
+                                  RS-530A lies in some of the modem control
+                                  interface signals. In RS-530 the signals all
+                                  of the modem control signals are differential,
+                                  in RS-530A some of these signals are single 
+                                  ended.
+
+               V35                ITU V.35 electrical characteristics are a
+                                  combination of unbalanced voltage and balanced
+                                  current mode signals. Data and clock signals
+                                  are balanced current mode circuits. These
+                                  circuits typically have voltage levels from 
+                                  0.5 Volts to -0.5 Volts (1 Volt differential).
+                                  The modem control signals are unbalanced
+                                  signals and are compatible with RS-232.
+
+               
+   flags       misc options, HDLC_FLAG prefix is used for historical reasons,
+               but unless otherwise specified these flags apply to all modes.
+               
+	       Special Flags
+	       ________________________________________
+	       HDLC_FLAG_UNDERRUN_ABORT7  Sends an abort code consisting
+					  of a zero followed by 7 ones.
+					  0x7f
+	       HDLC_FLAG_UNDERRUN_ABORT15 Sends an abort code consisting
+					  of a zero followed by 15 ones.
+					  0x7fff
+	       HDLC_FLAG_UNDERRUN_FLAG    Sends the hdlc/sdlc flag 0x7e 
+ 
+               HDLC_FLAG_UNDERRUN_CRC     Automatically attach a generated 
+					  CRC on the end of the data in 
+                                          order to complete the sdlc frame. 
+
+	       HDLC_FLAG_SHARE_ZERO       Only applies when 
+                                          HDLC_TXIDLE_FLAGS is in use.
+					  Make consecutive flags share a
+                                          single zero. (01010 vs. 010010, 
+					  if flag is 010)
+					  
+               Receive Clock Source (mutually exclusive)
+               -----------------------------------------
+               HDLC_FLAG_RXC_DPLL         Receive clock recovered from
+                                          the DPLL. The DPLL reference
+                                          clock speed is specified in the
+                                          clock_speed member of the
+                                          R56_PARAMS structure.
+
+               HDLC_FLAG_RXC_BRG          Receive clock generated
+                                          with baud rate generator (BRG) at 
+				          the speed specified in the clock_speed
+                                          member of the R56_PARAMS structure
+
+               HDLC_FLAG_RXC_RXCPIN       Receive clock is taken from the
+                                          RxClk Input Pin.
+
+               HDLC_FLAG_RXC_TXCPIN       Receive clock is taken from the
+                                          TxClk Input Pin.
+
+               Transmit Clock Source (mutually exclusive)
+               ------------------------------------------
+               HDLC_FLAG_TXC_DPLL         Transmit clock is recovered from
+                                          the DPLL. The DPLL reference
+                                          clock speed is specified in the
+                                          ClockSpeed member of the
+                                          R56_PARAMS structure.
+
+               HDLC_FLAG_TXC_BRG          Transmit clock is generated
+                                          internally with the baud rate
+                                          generator (BRG) at the speed
+                                          specified in the clock_speed
+                                          member of the R56_PARAMS
+                                          structure.
+
+               HDLC_FLAG_TXC_RXCPIN       Transmit clock is taken from the
+                                          RxClk Input Pin.
+
+               HDLC_FLAG_TXC_TXCPIN       Transmit clock is taken from the
+                                          TxClk Input Pin.
+
+               Digital Phase Lock Loop Divisors (mutually exclusive)
+               -----------------------------------------------------
+               HDLC_FLAG_DPLL_DIV16       DPLL reference clock divisor is 16
+
+
+               Miscellaneous (any combination)
+               -------------------------------
+
+               HDLC_FLAG_AUTO_CTS         Don't start transmitting a frame
+                                          until CTS goes active. If CTS
+                                          goes inactive during
+                                          transmission, the transmission
+                                          is immediately stopped.
+
+               HDLC_FLAG_AUTO_DCD         Don't receive frames when DCD is
+                                          inactive.
+
+               HDLC_FLAG_AUTO_RTS         Automatically assert RTS at the
+                                          start of a transmit request and
+                                          deactivate RTS upon completion
+                                          of the frame transmission. If
+                                          RTS is active when a transmit
+                                          request is made, the driver will
+                                          not manipulate the state of RTS.
+
+
+   encoding    encoding determines how the TxD and RxD pins
+               represent data bits or logical 1s and 0s. Note that often
+               NRZI_SPACE is simply called NRZI.
+
+               HDLC_ENCODING_NRZ          No encoding,
+                                          high = 1, low = 0.
+
+               HDLC_ENCODING_NRZB         Inverted Encoding,
+                                          high = 0, low = 1.
+
+               HDLC_ENCODING_NRZI_MARK    Invert state at start of bit
+                                          cell for a 1, maintain state for 0.
+
+               HDLC_ENCODING_NRZI_SPACE   Invert state at start of bit
+               HDLC_ENCODING_NRZI         cell for a 0, maintain state for
+                                          a 1.
+
+               HDLC_ENCODING_BIPHASE_MARK Always invert state at start of
+                                          bit cell. Invert in middle of
+                                          bit cell if 1, maintain state if 0.
+                                          Used with DPLL clock recovery.
+
+               HDLC_ENCODING_BIPHASE_SPACE
+                                          Always invert state at start of
+                                          bit cell. Invert in middle of
+                                          bit cell if 0, maintain state if 1.
+                                          Used with DPLL clock recovery.
+
+               HDLC_ENCODING_BIPHASE_LEVEL
+                                          Start of bit cell is high for 1,
+                                          low for 0. Always invert in
+                                          middle of bit cell.
+                                          Used with DPLL clock recovery.
+
+               HDLC_ENCODING_DIFF_BIPHASE_LEVEL
+                                          Invert at start of bit cell if
+                                          1, maintain for 0. Always invert
+                                          in middle of bit cell.
+                                          Used with DPLL clock recovery.
+
+
+   clock_speed   data rate of generated clock on AUXCLK output
+                 0 = disable clock generation
+
+               The clock is generated by dividing a set clock frequency of
+               14.7456MHz by an integer called the time constant. The time
+               constant is related to the data rate by:
+
+               Time Constant = (Clock Frequency/Data Rate) - 1
+
+               If the calculated time constant for a particular speed is
+               an integer (or zero) then the specified data rate can be
+               generated exactly. Otherwise the actual data rate is the
+               data rate specified by the time constant rounded up to the
+               next integer value. For relatively low non standard data
+               rates, the resulting error will be small. The clock
+               frequency allows common data rate to be specified exactly:
+               2400, 9600, 57600, 115200 etc.
+
+   addr_filter   discard received HDLC frames with addresses other than
+                 0xFF (broadcast) or addr_filter value. If addr_filter is
+                 0xFF then no filtering is done.
+
+   crc_type    HDLC Hardware Cyclic Redundancy Check
+
+               HDLC_CRC_NONE              Don't send CRCs on transmit,
+                                          don't check CRCs on receive.
+
+               HDLC_CRC_16_CCITT          16 bit CRC Polynomial:
+                                             X^15+X^12+X^5+1
+
+               HDLC_CRC_32_CCITT          32 bit CRC Polynomial:
+                                             X^32 + X^26 + X^23 + 
+                                             X^22 + X^16 + X^12 +
+                                             X^11 + X^10 + X^8  +
+                                             X^7  + X^5  + X^4  +
+                                             X^2  + X    + 1
+
+               HDLC_CRC_RETURN_EX         when or'ed with
+                                          HDLC_CRC_16_CCITT or
+                                          HDLC_CRC_32_CCITT, results in
+                                          the received frame being
+                                          returned in it entirety,
+                                          including CRC bytes and an
+                                          additional byte indicating if
+                                          the frame was good, or had a CRC
+                                          error.
+
+   The preamble is a bit pattern sent on the transmit pin before
+   sending each HDLC frame. The preamble pattern and length are set
+   with the constants listed below. Use the preamble to synchronize a
+   remote phase locked loop or to guarantee a minimum number of flags
+   between frames. Including the opening and closing flags, 3, 4, 6,
+   and 10 flags can be inserted between frames.
+
+   preamble_length specifies the number of preamble bits to generate:
+
+
+               HDLC_PREAMBLE_LENGTH_16BITS
+               HDLC_PREAMBLE_LENGTH_32BITS
+               HDLC_PREAMBLE_LENGTH_64BITS
+
+   preamble    pattern generated at the start of
+               each transmit HDLC frame:
+
+               HDLC_PREAMBLE_PATTERN_NONE    none (preamble_length ignored)
+               HDLC_PREAMBLE_PATTERN_ZEROS   all zeroes
+               HDLC_PREAMBLE_PATTERN_FLAGS   all flags
+               HDLC_PREAMBLE_PATTERN_10      alternating 1's and 0's
+               HDLC_PREAMBLE_PATTERN_01      alternating 0's and 1's
+               HDLC_PREAMBLE_PATTERN_ONES    all ones
+
+
+R56_IOCGTXIDLE - Get Transmit Idle Mode
+----------------------------------------
+
+   int idlemode;
+   rc = ioctl(fd, R56_IOCGTXIDLE, &idlemode);
+
+Return current transmit idle mode.
+See R56_IOCSTXIDLE (Set Transmit Idle Mode) for more details.
+
+
+R56_IOCSTXIDLE - Set Transmit Idle Mode
+----------------------------------------
+
+   int idlemode = HDLC_TXIDLE_FLAGS;
+   rc = ioctl(fd, R56_IOCGTXIDLE, idlemode);
+
+Set the transmit idle mode. When the transmitter is enabled but
+not sending data, it sends the idle pattern.
+This applies only to synchronous modes. The transmitter always
+sends continuous marks when idle in asynchronous mode.
+
+   All Adapters:
+
+   HDLC_TXIDLE_FLAGS             stream continuous flags.
+   HDLC_TXIDLE_ONES              send continuous ones.
+   HDLC_TXIDLE_MARK              send continuous marks.
+   HDLC_TXIDLE_ALT_ZEROS_ONES    send alternating zeros and ones.
+   HDLC_TXIDLE_ZEROS             send continuous zeros.
+   HDLC_TXIDLE_ALT_MARK_SPACE    send alternating marks and space.
+   HDLC_TXIDLE_SPACE             send continuous space.
+
+
+R56_IOCTXENABLE - Enable/Disable transmitter
+---------------------------------------------
+
+   int enable = 1;
+   rc = ioctl(fd, R56_IOCTXENABLE, enable);
+
+Enable or disable the transmitter. 0=disable, 1=enable
+
+The driver automatically enables the transmitter on a write() call.
+
+When disabled, transmit data signal is a constant mark.
+When enabled, the transmitter is either sending data or the idle pattern.
+
+
+R56_IOCRXENABLE - Enable/Disable receiver
+------------------------------------------
+
+   int enable = 1;
+   rc = ioctl(fd, R56_IOCRXENABLE, enable);
+
+Enable or disable receiver. 0=disable, 1=enable, 2=force hunt mode
+
+A disabled receiver never returned received data.
+
+Note: a request for R56_IOCSPARAMS will automatically enable the
+      receiver as long as the device was opened with read mode enabled --
+      typically a value of O_RDWR is passed on the open() system call.
+
+When the receiver goes from disabled to enabled, all receive
+buffers internal to the driver are reset.
+
+
+R56_IOCTXABORT - Abort HDLC send frame in progress
+---------------------------------------------------
+
+   rc = ioctl(fd, R56_IOCTXABORT);
+
+Abort an HDLC send frame in progress with an HDLC abort pattern
+(7 or more contiguous ones). Only valid in HDLC mode.
+
+
+R56_IOCGSTATS - Get Statistics
+--------------------------------
+
+   struct r56_icount icount;
+   rc = ioctl(fd, R56_IOCGSTATS, &icount);
+
+Return or reset the current r56_icount structure values maintained by
+the driver. Pass an argument of 0 instead of a pointer to a structure to
+reset the statistics. Statistics are automatically reset on the
+first open on a device instance.
+
+The r56_icount structure is defined in
+route56.h and is defined as :
+
+   struct r56_icount {
+      __u32   cts, dsr, rng, dcd, tx, rx;
+      __u32   frame, parity, overrun, brk;
+      __u32   buf_overrun;
+      __u32   txok;
+      __u32   txunder;
+      __u32   txabort;
+      __u32   txtimeout;
+      __u32   rxshort;
+      __u32   rxlong;
+      __u32   rxabort;
+      __u32   rxover;
+      __u32   rxcrc;
+      __u32   rxok;
+      __u32   exithunt;
+      __u32   rxidle;
+   };
+
+   cts            number of transitions in Clear to Send (CTS).
+
+   dsr            number of transitions in Data Set Ready (DSR).
+
+   rng            number of transitions in Ring Indicator (RI).
+
+   dcd            number of transitions in Data Carrier Detect (DCD).
+
+   tx             number of transmitted asynchronous data bytes.
+
+   rx             number of received asynchronous data bytes.
+
+   frame          number of asynchronous framing errors detected.
+
+   parity         number of asynchronous parity errors detected.
+
+   overrun        number of asynchronous receive overruns detected.
+
+   brk            number of asynchronous break sequences detected.
+
+   buf_overrun    asynchronous mode: number of times the driver's receive
+                  buffer overflowed.
+
+                  HDLC mode: number of times the driver's receive buffers
+                  were exhausted and had to shutdown the receiver until
+                  buffers became available. (data lost).
+
+   txok           number of successful HDLC frame transmissions.
+
+   txunder        number of times an HDLC frame transmit underrun
+                  occurred.
+
+   txabort        number of times an HDLC frame was aborted with an abort
+                  sequence.
+
+   txtimeout      number of times a transmit operation timed out.
+
+   rxshort        number of received HDLC short frames (less than two
+                  bytes if no CRC generation is configured or less than
+                  four bytes if CRC generation is configured. (frame
+                  discarded).
+
+   rxlong         number of received HDLC frames larger than 4096 bytes.
+                  (frame discarded).
+
+   rxabort        number of received HDLC abort sequences detected.
+                  (frame discarded).
+
+   rxover         number of times a received HDLC frame terminated due to
+                  a receiver overrun error. (frame discarded).
+
+   rxcrc          number of received HDLC frames received in error.
+                  (frame discarded).
+
+   rxok           number of successfully received HDLC frames.
+
+   exithunt       number of times the receiver exitted hunt mode while in
+                  HDLC mode (enabled via a R56_IOCWAITEVENT request).
+
+   rxidle         number of times the receiver detected an idle sequence
+                  while in HDLC mode (enabled via a R56_IOCWAITEVENT
+                  request).
+
+
+
+R56_IOCWAITEVENT - wait for specified events
+---------------------------------------------
+
+   int events = Rt56Event_DcdActive + Rt56Event_CtsInactive;
+   rc = ioctl(fd, R56_IOCWAITEVENT, &events);
+
+Wait for specified event. Specify event of interest in events variable.
+On return, inspect events variable to determine which event occurred.
+
+   Rt56Event_DsrActive     wait for Data Set Ready (DSR) active
+
+   Rt56Event_DsrInactive   wait for Data Set Ready (DSR) inactive
+
+   Rt56Event_Dsr           same as specifying both DsrActive and DsrInactive
+                           use to poll current DSR state
+
+   Rt56Event_CtsActive     wait for Clear to Send (CTS) active
+
+   Rt56Event_CtsInactive   wait for Clear to Send (CTS) inactive.
+
+   Rt56Event_Cts           same as specifying both CtsActive and CtsInactive
+                           use to poll current CTS state
+
+   Rt56Event_DcdActive     wait for Data Carrier Detect (DCD) active
+
+   Rt56Event_DcdInactive   wait for Data Carrier Detect (DCD) inactive
+
+   Rt56Event_Dcd           same as specifying both DcdActive and DcdInactive
+                           use to poll current DCD state
+
+   Rt56Event_RiActive      wait for Ring Indicator (RI) active
+
+   Rt56Event_RiInactive    wait for Ring Indicator (RI) inactive
+
+   Rt56Event_Ri            same as specifying both RiActive and RiInactive
+                           use to poll current RI state
+
+   Rt56Event_ExitHuntMode  wait for receiver to detect
+                           opening flag or sync pattern
+
+   Rt56Event_IdleReceived  wait for receiver to detect idle pattern
+
+
+DPLL Clock Recovery
+===================
+
+Synchronous modes usually get transmit and receive timing from
+the transmit and receive clock inputs.
+
+Alternatively, timing can be recovered from a data signal
+using a digital phased locked loop (DPLL). DPLL clock recovery
+requires the exact data rate to be known in advance and specified
+in ClockSpeed field of the R56_PARAMS structure.
+
+Use these options in the flags field of the R56_PARAMS structure to
+use DPLL clock recovery:
+
+   HDLC_FLAG_RXC_DPLL      Receive clock comes from DPLL (recovered)
+
+   HDLC_FLAG_TXC_DPLL      Transmit clock comes from DPLL (recovered)
+
+   HDLC_FLAG_TXC_BRG       Transmit clock comes from internal BRG
+
+The DPLL recovers a receive clock from the received data signal.
+The transmit clock is usually generated internally from the BRG,
+for DPLL applications. Alternatively, the transmit clock may
+be selected as the recovered receive clock.
+
+The DPLL uses a reference clock that is 16 times greater than
+the actual data rate. Specify the following flag in the flags
+field of the R56_PARAMS structure:
+
+   HDLC_FLAG_DPLL_DIV16     DPLL reference clock is 16 x ClockSpeed.
+
+The reference clock is generated from the adapter oscillator frequency,
+which limits which data rates can be recovered.
+
+Clocks are generated by dividing the oscillator frequency by an integer
+divisor which allows only specific data rates to be generated exactly.
+The relation for calculating the generated clock speed is:
+
+   rate = (Oscillator Frequency)/((16 bit integer) + 1)
+
+For a data rate to be created exactly, the data rate must be an even
+divisor of the oscillator frequency. DPLL applications require that both
+the base data rate and the DPLL reference clock (base rate times the DPLL
+divisor) be even divisors of the oscillator frequency.
+
+Commonly used data rates that meet this requirement are 9600, 19200,
+38400, 57600, and 115200 bits per second. A DPLL application that requires
+a data rate than cannot be exactly generated may still work if the
+difference between the exact rate and the actual rate is small enough and
+if a sufficient number of transitions on RxD are maintained.
+
+
+Raw Sync Mode
+=============
+
+Raw bit-synchronous mode uses a continuous stream of bits without framing
+(no flags) or additional encoding (no zero stuffing or deletion).
+
+Setting the mode field of the R56_PARAMS structure to HDLC_MODE_RAW
+selects raw bit-synchronous mode. CRC checking should be disabled in
+this mode.
+
+The adapter stores received data when Data Carrier Detect (DCD) is active.
+The driver returns received data to the application in 4096 byte blocks
+as each 4096 byte receive DMA buffer is filled. The max_frame_size setting
+should be left at the default of 4096. If DCD is negated, any partially filled
+buffer is immediately returned to the application, which must
+determine what portion of the buffer contains valid data.
+
+The adapter transmits a continuous bit stream as long as data
+is available in the transmit DMA buffers. When the DMA buffers are empty,
+an idle pattern is transmitted. The driver uses a seperate set of transmit
+holding buffers to keep the transmit DMA buffers filled. The application
+should keep sending data as fast as possible to avoid interrupting the
+transmit bit stream.
+
+Set the number of transmit DMA buffers with the 'txdmabufs' argument
+to the command line used to load the route56.o driver module.
+NOTE: each transmit DMA buffer reduces the number of receive dma buffers.
+
+Set the number (1 to 5) of transmit holding buffers with the 'txholdbufs'
+argument on the command line used to load the route56.o driver.module.
+
+Start with txdmabufs=2 and txholdbufs=2. If interruptions to the transmit
+bit stream occur, try increasing txholdbufs. If interruptions continue
+with txholdbufs=5, try increasing txdmabufs.
+
+
+
+Extended Receive Mode (return CRC/indications)
+=============================================
+
+Normally, only HDLC frames without error are returned to the application.
+HDLC frames with CRC errors are discarded after updating the CRC error
+count in the adapter statistics.
+
+The driver can be configured to return both good frames and frame
+with CRC errors. For example, an application may be able to apply
+an error recovery algorithm to a bad frame to rebuild the data.
+
+Add the HDLC_CRC_RETURN_EX flag to the CRC type in the R56_PARAMS
+structure to receive both good and bad frames.
+
+   params.crc_type = HDLC_CRC_16_CCITT | HDLC_CRC_RETURN_EX;
+
+configures the driver to use CCITT CRC16, and pass extended frame
+information back to the application.
+
+When HDLC_CRC_RETURN_EX is set, a read() call returns the
+received frame data, 2 (CRC-16) or 4 (CRC-32) CRC bytes,
+and a status byte (RX_OK) or bad (RX_CRC_ERROR) as shown below:
+
+    0        n
+   | | .... | | |crc| |status|
+
+where
+
+   bytes 0-n   frame data (data_size)
+
+   'crc'       2 (CRC-16) or 4 (CRC-32) crc bytes (crc_size)
+
+   'status'    status byte indicating a good frame (RX_OK) or a
+               frame received with a CRC error (RX_CRC_ERROR)
+
+The value returned by read() is:
+
+   data_size + crc_size + 1
+
+
+ASYNCHRONOUS COMMUNICATIONS
+===========================
+
+When a Route56 adapter is configured for asynchronous mode,
+all programming is done with the standard Linux systems calls
+and tty/termios functions. In this mode, the Route56 device
+operates the same as any other serial port. Refer to Linux
+documentation and third party books on the subject of
+serial device programming and termios functions for details.
+

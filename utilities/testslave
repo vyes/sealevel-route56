@@ -1,0 +1,69 @@
+#!/bin/sh
+
+# Run the mgsltest program in slave mode on an HDLC port.
+#
+# The testmaster script should be run on another HDLC port
+# to supply data clocks and to send frames to the slave port.
+#
+# The master and slave ports should be connected by a
+# NULL modem. The NULL modem should connect the master
+# (clock source) AUXCLK pin to the TxC/RxC pins of both
+# master and slave ports.
+
+
+# The first command line argument may be the slave port device name.
+# Default is "/dev/ttySL1" (2nd Route56 Adapter)
+
+if ( [ ! -z $1 ] ) then
+	DEVICE=$1
+else
+	DEVICE=/dev/ttySL1
+fi
+
+
+######################################################
+# verify presense of necessary utility programs to run test
+#
+PATH="/bin:/sbin:/usr/bin:/usr/sbin:/usr/local/bin:/usr/local/sbin:../scripts"
+
+
+######################################################
+#
+# Check for device drivers loaded and nodes made
+#
+( lsmod | grep -i "route56"    >/dev/null) || { 
+    echo "ERROR:  Route56 driver is not loaded,"
+    echo "         please exectue r56load"
+    exit 1 
+}
+
+( lsmod | grep -i "n_hdlc"     >/dev/null) || { 
+    echo "ERROR:  N_HDLC driver is not loaded,"
+    echo "         please execute r56load"
+    exit 1
+}
+
+[ -c $DEVICE ] || {
+    echo "ERROR:  Device node($DEVICE) doesn't exist!"
+    echo "         please execute r56load"
+    exit 1
+}
+
+
+# set SPEED to 0 to disable clock generation
+# (clocks are supplied by master)
+SPEED=0
+
+# Set slave port configuration.
+#
+# * hdlc option sets bit-synchronous HDLC mode
+# * nrz selects NRZ encoding
+# * clock $SPEED with SPEED==0 disables clock generation
+# * -loopback disables internal loopback mode
+# * txc takes transmit clock from the TxC pin
+# * rxc takes receive clock from the RxC pin
+
+r56util $DEVICE hdlc nrz clock $SPEED -loopback txc rxc
+
+# start the mgsltest program in slave mode
+r56test $DEVICE slave
